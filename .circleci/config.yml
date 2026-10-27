@@ -1,0 +1,87 @@
+version: 2.1
+setup: true
+orbs:
+  orb-tools: circleci/orb-tools@12.5
+  shellcheck: circleci/shellcheck@3.4
+
+filters: &filters
+  tags:
+    only: /.*/
+
+jobs:
+  # Runs verify, pull and publish offline (T-1, T-2), against tests/fake_aws.py, a stand-in for
+  # the AWS CLI backed by a local directory that can answer 403, 404, 409 and 412 or ignore
+  # conditions, and tests/apk_fixtures.py, a stand-in for melange. Then checks how the command
+  # YAML and the scripts fit together, and that no write is unconditional (T-8).
+  test-commands:
+    parameters:
+      image:
+        type: string
+    docker:
+      - image: << parameters.image >>
+    steps:
+      - checkout
+      - run:
+          name: Show the tool versions
+          command: |
+            bash --version | awk 'NR == 1'
+            python3 --version
+            openssl version
+      - run:
+          name: Run command tests
+          command: bash tests/commands_test.sh
+      - run:
+          name: Run wiring test
+          command: bash tests/wiring_test.sh
+  test-env-subst:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - run:
+          name: Run circleci env subst tests
+          command: bash tests/env_subst_test.sh
+      - run:
+          name: Run shell conventions test
+          command: bash tests/shell_conventions_test.sh
+  # Checks that every command has a GitHub Action that takes the same inputs and runs the same
+  # scripts, and tests actions/run_script.sh, which runs the scripts on GitHub Actions.
+  test-actions:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - run:
+          name: Run GitHub Actions tests
+          command: bash tests/actions_test.sh
+
+workflows:
+  lint-pack:
+    jobs:
+      # cimg/base has python3 and openssl; cimg/python:3.8 runs the helper on the oldest Python
+      # the orb supports.
+      - test-commands:
+          matrix:
+            parameters:
+              image: ["cimg/base:current", "cimg/python:3.8"]
+          filters: *filters
+      - test-env-subst:
+          filters: *filters
+      - test-actions:
+          filters: *filters
+      - orb-tools/lint:
+          filters: *filters
+      - orb-tools/pack:
+          filters: *filters
+      - orb-tools/review:
+          orb_name: apk-repo
+          filters: *filters
+      - shellcheck/check:
+          filters: *filters
+      # Triggers the next workflow in the Orb Development Kit.
+      - orb-tools/continue:
+          pipeline_number: << pipeline.number >>
+          vcs_type: << pipeline.project.type >>
+          orb_name: apk-repo-orb
+          requires: [test-commands, test-env-subst, test-actions, orb-tools/lint, orb-tools/pack, orb-tools/review, shellcheck/check]
+          filters: *filters

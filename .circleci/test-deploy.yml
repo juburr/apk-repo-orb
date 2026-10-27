@@ -1,0 +1,201 @@
+version: 2.1
+orbs:
+  # Your orb will be automatically injected here during the pipeline.
+  # Reference your orb's jobs and commands below as they will exist when built.
+  orb-tools: circleci/orb-tools@12.5
+  # The orb definition is intentionally not included here. It will be injected into the pipeline.
+  apk-repo-orb: {}
+  melange-orb: juburr/melange-orb@1.2.0
+  apko-orb: juburr/apko-orb@1.1.0
+
+# Use this tag to ensure test jobs always run,
+# even though the downstream publish job will only run on release tags.
+filters: &filters
+  tags:
+    only: /.*/
+
+# Filter for release tags.
+release-filters: &release-filters
+  branches:
+    ignore: /.*/
+  tags:
+    only: /^v[0-9]+\.[0-9]+\.[0-9]+$/
+
+# The local S3 server's credentials (tests/s3_server.sh); never real ones.
+s3-environment: &s3-environment
+  AWS_ACCESS_KEY_ID: apk-repo-test
+  AWS_SECRET_ACCESS_KEY: apk-repo-test-secret
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_EC2_METADATA_DISABLED: "true"
+
+executors:
+  # melange's docker runner and the S3 server need a Docker daemon of their own.
+  machine-amd64:
+    machine:
+      image: ubuntu-2404:current
+    resource_class: medium
+  machine-arm64:
+    machine:
+      image: ubuntu-2404:current
+    resource_class: arm.medium
+
+commands:
+  show-tools:
+    steps:
+      - run:
+          name: Show the tool versions
+          command: |
+            uname -m
+            python3 --version
+            openssl version
+            aws --version
+            melange version 2>&1 | grep -i gitversion || true
+
+jobs:
+  # T-3: verify accepts what real melange writes (melange build, sign and index, and an index
+  # merge) and refuses a one-byte change in each signed segment.
+  golden-test:
+    parameters:
+      melange_version:
+        type: string
+    executor: machine-amd64
+    steps:
+      - checkout
+      - melange-orb/install:
+          version: << parameters.melange_version >>
+      - run:
+          name: Run the golden tests
+          command: bash tests/golden_test.sh
+  # T-4 and T-5: publish, pull and verify with the real AWS CLI and melange against versitygw,
+  # which tests/s3_server.sh first proves answers 412 to failed conditional writes (F-14,
+  # F-15), then 20 rounds of two publishes at once.
+  integration-test:
+    parameters:
+      melange_version:
+        type: string
+    executor: machine-amd64
+    environment: *s3-environment
+    steps:
+      - checkout
+      - melange-orb/install:
+          version: << parameters.melange_version >>
+      - show-tools
+      - run:
+          name: Start the S3 server
+          command: bash tests/s3_server.sh apk-repo-test
+      - run:
+          name: Run the integration tests
+          command: bash tests/integration_test.sh
+          environment:
+            APK_REPO_BUCKET: apk-repo-test
+            RACE_ROUNDS: "20"
+  # T-6: the orb's commands as a pipeline runs them: melange builds a package, publish uploads
+  # it, pull fetches it into a fresh directory, verify checks it, and apko builds an image from
+  # it, which must run the package's script.
+  end-to-end-test:
+    parameters:
+      executor:
+        type: executor
+    executor: << parameters.executor >>
+    environment: *s3-environment
+    steps:
+      - checkout
+      - melange-orb/install
+      - apko-orb/install
+      - show-tools
+      - run:
+          name: Start the S3 server
+          command: bash tests/s3_server.sh apk-repo-e2e
+      - run:
+          name: Make the keys and build the package
+          command: |
+            melange keygen build.rsa
+            melange keygen apk-repo-test.rsa
+            mkdir -p keyring
+            mv apk-repo-test.rsa.pub keyring/
+            printf 'export %s=%q\n' APK_SIGNING_KEY "$(cat apk-repo-test.rsa)" >> "${BASH_ENV}"
+            rm apk-repo-test.rsa
+            melange build tests/fixtures/melange.yaml --runner docker --arch "$(uname -m)" \
+              --signing-key build.rsa --out-dir packages
+      - apk-repo-orb/publish:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          key_name: apk-repo-test.rsa
+          allow_create: true
+      - run:
+          name: Check the publish receipt
+          command: |
+            python3 -I - "${APK_REPO_RECEIPT}" "$(uname -m)" \<< 'EOF'
+            import json, sys
+            receipt, arch = json.load(open(sys.argv[1])), sys.argv[2]
+            published = receipt["architectures"][arch]["published"]
+            assert published == ["apk-repo-hello-0.0.1-r0.apk"], published
+            assert receipt["architectures"][arch]["index"]["signature"] == ".SIGN.RSA256.apk-repo-test.rsa.pub"
+            print("Published", published)
+            EOF
+      - apk-repo-orb/pull:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          out_dir: pulled
+      - apk-repo-orb/verify:
+          dir: pulled
+          keyring: keyring
+      - apko-orb/build:
+          config: tests/fixtures/apko.yaml
+          image: apk-repo-e2e:latest
+          arch: host
+          log_level: info
+          output_path: image/e2e.tar
+      - run:
+          name: Run the image
+          command: |
+            case "$(uname -m)" in
+              x86_64) tag=amd64 ;;
+              aarch64) tag=arm64 ;;
+            esac
+            docker load --input image/e2e.tar
+            OUTPUT=$(docker run --rm "apk-repo-e2e:latest-${tag}")
+            echo "${OUTPUT}"
+            if [[ "${OUTPUT}" != "hello from apk-repo-orb" ]]; then
+              echo "The image didn't run the pulled package's script."
+              exit 1
+            fi
+
+workflows:
+  test-deploy:
+    jobs:
+      # Make sure to include "filters: *filters" in every test job you want to run as part of your deployment.
+      - golden-test:
+          matrix:
+            parameters:
+              melange_version: ["0.61.2", "0.63.1"]
+          filters: *filters
+      - integration-test:
+          matrix:
+            parameters:
+              melange_version: ["0.61.2", "0.63.1"]
+          filters: *filters
+      - end-to-end-test:
+          matrix:
+            parameters:
+              executor: [machine-amd64, machine-arm64]
+          filters: *filters
+      # The orb must be re-packed for publishing, and saved to the workspace.
+      - orb-tools/pack:
+          filters: *release-filters
+      - orb-tools/publish:
+          orb_name: juburr/apk-repo-orb
+          vcs_type: << pipeline.project.type >>
+          pub_type: production
+          # Ensure this job requires all test jobs and the pack job.
+          requires:
+            - orb-tools/pack
+            - golden-test
+            - integration-test
+            - end-to-end-test
+          context: orb-publishing
+          filters: *release-filters

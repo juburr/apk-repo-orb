@@ -1,0 +1,87 @@
+description: >
+  Build once, reuse everywhere: one job builds packages with melange and
+  publishes them for x86_64 and aarch64; the next pulls them, verifies them
+  offline, and builds a multi-architecture image with apko. Both jobs run
+  the orb's commands on machine executors, which have the AWS CLI and,
+  for melange's docker runner, a Docker daemon. AWS_ROLE_ARN, AWS_REGION
+  and APK_SIGNING_KEY come from the context. The verify step needs no
+  network; with receipt_path, each step leaves a JSON receipt of exactly
+  what it published, pulled or verified, which store_artifacts keeps.
+
+usage:
+  version: 2.1
+  orbs:
+    apk-repo: juburr/apk-repo-orb@0.1.0
+    apko: juburr/apko-orb@1.1.0
+    melange: juburr/melange-orb@1.2.0
+  commands:
+    aws-oidc:
+      steps:
+        - run:
+            name: Use the job's OIDC token for AWS
+            command: |
+              printf '%s' "${CIRCLE_OIDC_TOKEN_V2}" > /tmp/aws-web-identity-token
+              printf 'export AWS_WEB_IDENTITY_TOKEN_FILE=%q\n' /tmp/aws-web-identity-token >> "${BASH_ENV}"
+  jobs:
+    publish:
+      parameters:
+        resource_class:
+          type: string
+      machine:
+        image: ubuntu-2404:current
+      resource_class: << parameters.resource_class >>
+      steps:
+        - checkout
+        - melange/install
+        - run:
+            name: Build the packages
+            command: |
+              melange keygen build.rsa
+              melange build melange.yaml --runner docker --arch "$(uname -m)" \
+                --signing-key build.rsa --out-dir packages
+        - aws-oidc
+        - apk-repo/publish:
+            bucket: my-org-apk
+            prefix: my-org/os
+            keyring: keys
+            key_name: my-org-apk.rsa
+            receipt_path: receipts/publish.json
+        - store_artifacts:
+            path: receipts
+    image:
+      machine:
+        image: ubuntu-2404:current
+      steps:
+        - checkout
+        - aws-oidc
+        - apk-repo/pull:
+            bucket: my-org-apk
+            prefix: my-org/os
+            arch: x86_64 aarch64
+            keyring: keys
+            out_dir: packages
+            receipt_path: receipts/pull.json
+        - apk-repo/verify:
+            dir: packages
+            arch: x86_64 aarch64
+            keyring: keys
+            receipt_path: receipts/verify.json
+        - apko/install
+        - apko/build:
+            config: apko.yaml
+            image: ghcr.io/my-org/app:latest
+            arch: amd64,arm64
+            output_path: build/app.tar
+        - store_artifacts:
+            path: receipts
+  workflows:
+    build:
+      jobs:
+        - publish:
+            matrix:
+              parameters:
+                resource_class: [medium, arm.medium]
+            context: apk-publishing
+        - image:
+            requires: [publish]
+            context: apk-publishing

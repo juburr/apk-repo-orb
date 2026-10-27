@@ -1,0 +1,156 @@
+name: Publish APK packages
+description: >
+  Publishes the packages melange built (packages_dir/<arch>/*.apk) to a
+  signed APK repository in an S3 bucket. It re-signs each package with your
+  production key, uploads it with a signed SHA-256 sidecar, then merges it
+  into the bucket's index and signs that. The index is only replaced if
+  nobody changed it in the meantime (If-Match), so concurrent publishers
+  never lose each other's packages, and published packages are never
+  overwritten or deleted. It first checks that the bucket enforces those
+  conditional writes. Writes a JSON receipt of what it published. Needs
+  melange (melange-orb's install command), the AWS CLI v2 (2.22.5 or
+  newer) with credentials, python3 (3.8 or newer) and the openssl CLI.
+  The GitHub Actions twin of the orb's publish command.
+author: juburr
+
+inputs:
+  backend:
+    default: s3
+    description: >
+      Where the repository is stored. Only s3 (Amazon S3 and S3-compatible
+      services) for now.
+  bucket:
+    description: >
+      The bucket that holds the repository. Environment variables are
+      expanded.
+    required: true
+  prefix:
+    description: >
+      The repository's key prefix in the bucket, such as my-org/os, with no
+      leading or trailing /. Its packages go to <prefix>/<arch>/.
+      Environment variables are expanded.
+    required: true
+  endpoint_url:
+    default: ""
+    description: >
+      An S3-compatible service's endpoint, passed as --endpoint-url. It must
+      be https://, or http:// to localhost, and enforce conditional writes.
+      Empty (the default) is AWS. Environment variables are expanded.
+  region:
+    default: ""
+    description: >
+      The bucket's region. Empty (the default) leaves it to the AWS CLI
+      (AWS_REGION, AWS_DEFAULT_REGION, its config). Environment variables
+      are expanded.
+  arch:
+    default: ""
+    description: >
+      Architectures to publish, space-separated: x86_64 and/or aarch64.
+      Empty (the default) is every packages_dir/<arch> that holds packages.
+      Environment variables are expanded.
+  keyring:
+    description: >
+      Public keys to trust, space-separated: files named <key>.rsa.pub, or
+      directories whose *.rsa.pub files are all trusted, from your
+      checkout. It must hold <key_name>.pub, which the private key has to
+      match, and the key of whatever signed the bucket's index. Environment
+      variables are expanded.
+    required: true
+  packages_dir:
+    default: packages
+    description: >
+      melange's --out-dir. Only its <arch>/*.apk files are read, and it is
+      never modified; its APKINDEX.tar.gz files are ignored. Environment
+      variables are expanded.
+  signing_key:
+    default: APK_SIGNING_KEY
+    description: >
+      Name of the environment variable that holds the PEM private key (or
+      the PEM base64-encoded), such as from a context. Never the key itself.
+  key_name:
+    description: >
+      The key's name, ending in .rsa, such as my-org-apk.rsa. Signatures are
+      named after it (.SIGN.RSA256.<key_name>.pub), and consumers' keyring
+      file must be <key_name>.pub. Environment variables are expanded.
+    required: true
+  resign:
+    default: "true"
+    description: >
+      Re-sign each package with the production key, replacing melange's
+      build-time signature.
+  allow_create:
+    default: "false"
+    description: >
+      Create the repository when the bucket has no index for an architecture
+      yet. Off by default, so a mistyped prefix fails instead of starting a
+      new repository.
+  max_attempts:
+    default: "5"
+    description: >
+      How many times to merge and upload each architecture's index when
+      another publish changes it first, with backoff between attempts.
+  publish_public_key:
+    default: "false"
+    description: >
+      Also upload <prefix>/<key_name>.pub, a convenience copy of the public
+      key. It is never a trust anchor: verify with the keyring from your
+      checkout.
+  s3_checksums:
+    default: "true"
+    description: >
+      Send each upload's SHA-256 for S3 to check (--checksum-sha256). Turn it
+      off for S3-compatible services that reject checksum headers.
+  dry_run:
+    default: "false"
+    description: >
+      Do everything but write: read and verify the bucket's index, prepare
+      the packages and the merged index, and report what would be uploaded.
+  receipt_path:
+    default: apk-repo-receipt.json
+    description: >
+      Where to write the JSON receipt of what was published. Its absolute
+      path is exported as APK_REPO_RECEIPT. Environment variables are
+      expanded.
+
+outputs:
+  receipt:
+    description: >
+      The absolute path of the JSON receipt the step wrote (receipt_path),
+      also in the APK_REPO_RECEIPT environment variable of later steps.
+    value: ${{ steps.receipt.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Publish APK packages
+      shell: bash
+      env:
+        PARAM_ALLOW_CREATE: ${{ inputs.allow_create }}
+        PARAM_ARCH: ${{ inputs.arch }}
+        PARAM_BACKEND: ${{ inputs.backend }}
+        PARAM_BUCKET: ${{ inputs.bucket }}
+        PARAM_DRY_RUN: ${{ inputs.dry_run }}
+        PARAM_ENDPOINT_URL: ${{ inputs.endpoint_url }}
+        PARAM_KEY_NAME: ${{ inputs.key_name }}
+        PARAM_KEYRING: ${{ inputs.keyring }}
+        PARAM_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        PARAM_PACKAGES_DIR: ${{ inputs.packages_dir }}
+        PARAM_PREFIX: ${{ inputs.prefix }}
+        PARAM_PUBLISH_PUBLIC_KEY: ${{ inputs.publish_public_key }}
+        PARAM_RECEIPT_PATH: ${{ inputs.receipt_path }}
+        PARAM_REGION: ${{ inputs.region }}
+        PARAM_RESIGN: ${{ inputs.resign }}
+        PARAM_S3_CHECKSUMS: ${{ inputs.s3_checksums }}
+        PARAM_SIGNING_KEY: ${{ inputs.signing_key }}
+      run: >-
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/publish.sh"
+        "SCRIPT_APK_REPO_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/apk_repo.sh"
+        "SCRIPT_APK_REPO_PY=${GITHUB_ACTION_PATH}/../../src/scripts/apk_repo.py"
+    # The script exported APK_REPO_RECEIPT through GITHUB_ENV; a
+    # composite action's outputs come from a step's outputs.
+    - name: Expose the receipt
+      id: receipt
+      shell: bash
+      run: |
+        delimiter="ghadelimiter_$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+        printf 'path<<%s\n%s\n%s\n' "${delimiter}" "${APK_REPO_RECEIPT:-}" "${delimiter}" >> "${GITHUB_OUTPUT}"

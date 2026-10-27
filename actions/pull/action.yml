@@ -1,0 +1,110 @@
+name: Pull an APK repository
+description: >
+  Downloads a signed APK repository from an S3 bucket into out_dir, ready
+  for apko as a file-path repository (repositories: ['@local ./packages']).
+  For each architecture it reads the index, verifies it with your keyring,
+  downloads only the packages it lists with their signed sidecars, and
+  verifies every byte in a private staging directory before moving anything
+  into out_dir. It never lists the bucket, and a missing or unreadable index
+  is an error, never an empty repository. Writes a JSON receipt of what it
+  pulled. Needs the AWS CLI v2 (2.22.5 or newer) with credentials, python3
+  (3.8 or newer) and the openssl CLI.
+  The GitHub Actions twin of the orb's pull command.
+author: juburr
+
+inputs:
+  backend:
+    default: s3
+    description: >
+      Where the repository is stored. Only s3 (Amazon S3 and S3-compatible
+      services) for now.
+  bucket:
+    description: >
+      The bucket that holds the repository. Environment variables are
+      expanded.
+    required: true
+  prefix:
+    description: >
+      The repository's key prefix in the bucket, such as my-org/os, with no
+      leading or trailing /. Its packages are at <prefix>/<arch>/.
+      Environment variables are expanded.
+    required: true
+  endpoint_url:
+    default: ""
+    description: >
+      An S3-compatible service's endpoint, passed as --endpoint-url. It must
+      be https://, or http:// to localhost. Empty (the default) is AWS.
+      Environment variables are expanded.
+  region:
+    default: ""
+    description: >
+      The bucket's region. Empty (the default) leaves it to the AWS CLI
+      (AWS_REGION, AWS_DEFAULT_REGION, its config). Environment variables
+      are expanded.
+  arch:
+    default: ""
+    description: >
+      Architectures to pull, space-separated: x86_64 and/or aarch64. Empty
+      (the default) is the machine's own. Environment variables are
+      expanded.
+  keyring:
+    description: >
+      Public keys to trust, space-separated: files named <key>.rsa.pub, or
+      directories whose *.rsa.pub files are all trusted, from your
+      checkout. A key is never taken from the bucket. Environment variables
+      are expanded.
+    required: true
+  out_dir:
+    default: packages
+    description: >
+      Where to put the repository. Each out_dir/<arch> must not exist yet,
+      or be empty. Environment variables are expanded.
+  cache_dir:
+    default: ""
+    description: >
+      A directory of packages from earlier pulls. A cached package whose
+      SHA-256 matches its signed sidecar is used instead of downloading it,
+      and new packages are added to it; save and restore it with
+      save_cache and restore_cache. Empty (the default) caches nothing.
+      Environment variables are expanded.
+  receipt_path:
+    default: apk-repo-receipt.json
+    description: >
+      Where to write the JSON receipt of what was pulled. Its absolute path
+      is exported as APK_REPO_RECEIPT. Environment variables are expanded.
+
+outputs:
+  receipt:
+    description: >
+      The absolute path of the JSON receipt the step wrote (receipt_path),
+      also in the APK_REPO_RECEIPT environment variable of later steps.
+    value: ${{ steps.receipt.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Pull APK repository
+      shell: bash
+      env:
+        PARAM_ARCH: ${{ inputs.arch }}
+        PARAM_BACKEND: ${{ inputs.backend }}
+        PARAM_BUCKET: ${{ inputs.bucket }}
+        PARAM_CACHE_DIR: ${{ inputs.cache_dir }}
+        PARAM_ENDPOINT_URL: ${{ inputs.endpoint_url }}
+        PARAM_KEYRING: ${{ inputs.keyring }}
+        PARAM_OUT_DIR: ${{ inputs.out_dir }}
+        PARAM_PREFIX: ${{ inputs.prefix }}
+        PARAM_RECEIPT_PATH: ${{ inputs.receipt_path }}
+        PARAM_REGION: ${{ inputs.region }}
+      run: >-
+        bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/pull.sh"
+        "SCRIPT_APK_REPO_LIB=${GITHUB_ACTION_PATH}/../../src/scripts/lib/apk_repo.sh"
+        "SCRIPT_APK_REPO_PY=${GITHUB_ACTION_PATH}/../../src/scripts/apk_repo.py"
+    # The script exported APK_REPO_RECEIPT through GITHUB_ENV; a
+    # composite action's outputs come from a step's outputs.
+    - name: Expose the receipt
+      id: receipt
+      shell: bash
+      run: |
+        delimiter="ghadelimiter_$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+        printf 'path<<%s\n%s\n%s\n' "${delimiter}" "${APK_REPO_RECEIPT:-}" "${delimiter}" >> "${GITHUB_OUTPUT}"

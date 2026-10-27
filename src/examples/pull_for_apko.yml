@@ -1,0 +1,52 @@
+description: >
+  Pull a repository's packages into ./packages, verified against your
+  keyring, and build an image from them with apko. pull downloads only the
+  packages the signed index lists, with their signed SHA-256 sidecars, and
+  moves nothing into out_dir until every byte verifies. cache_dir keeps the
+  packages between jobs, and a cached package is reused only when its
+  SHA-256 matches its signed sidecar. apko.yaml trusts the same key and
+  takes the packages from the pulled directory:
+  keyring [./keys/my-org-apk.rsa.pub], repositories ['@local ./packages'],
+  packages [my-package@local]. AWS_ROLE_ARN and AWS_REGION come from the
+  context, for a role that only needs s3:GetObject and s3:ListBucket.
+
+usage:
+  version: 2.1
+  orbs:
+    apk-repo: juburr/apk-repo-orb@0.1.0
+    apko: juburr/apko-orb@1.1.0
+  jobs:
+    build-image:
+      machine:
+        image: ubuntu-2404:current
+      steps:
+        - checkout
+        - run:
+            name: Use the job's OIDC token for AWS
+            command: |
+              printf '%s' "${CIRCLE_OIDC_TOKEN_V2}" > /tmp/aws-web-identity-token
+              printf 'export AWS_WEB_IDENTITY_TOKEN_FILE=%q\n' /tmp/aws-web-identity-token >> "${BASH_ENV}"
+        - restore_cache:
+            keys:
+              - apk-cache-v1-{{ arch }}-
+        - apk-repo/pull:
+            bucket: my-org-apk
+            prefix: my-org/os
+            keyring: keys
+            out_dir: packages
+            cache_dir: apk-cache
+        - save_cache:
+            key: apk-cache-v1-{{ arch }}-{{ epoch }}
+            paths:
+              - apk-cache
+        - apko/install
+        - apko/build:
+            config: apko.yaml
+            image: ghcr.io/my-org/app:latest
+            arch: host
+            output_path: build/app.tar
+  workflows:
+    build:
+      jobs:
+        - build-image:
+            context: apk-pulling

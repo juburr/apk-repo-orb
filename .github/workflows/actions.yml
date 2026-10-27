@@ -1,0 +1,179 @@
+# Tests the GitHub Actions in actions/ on GitHub's own runners, as
+# .circleci/test-deploy.yml tests the orb's commands on CircleCI. Each job
+# runs the actions from this checkout (uses: ./actions/...), so a pull
+# request tests its own changes.
+name: GitHub Actions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+# The local S3 server's credentials (tests/s3_server.sh); never real ones.
+env:
+  AWS_ACCESS_KEY_ID: apk-repo-test
+  AWS_SECRET_ACCESS_KEY: apk-repo-test-secret
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_EC2_METADATA_DISABLED: "true"
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the offline tests
+        run: |
+          for test in tests/commands_test.sh tests/wiring_test.sh tests/actions_test.sh tests/env_subst_test.sh tests/shell_conventions_test.sh; do
+            echo "=== ${test}"
+            bash "${test}"
+          done
+
+  # T-3: verify accepts what real melange writes and refuses a one-byte change
+  # in each signed segment.
+  golden:
+    strategy:
+      fail-fast: false
+      matrix:
+        melange: ["0.61.2", "0.63.1"]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: juburr/melange-orb/actions/install@95a73caf0feebdd9b2480bf94ec64ca210f764b0 # v1.2.0
+        with:
+          version: ${{ matrix.melange }}
+      - name: Run the golden tests
+        run: bash tests/golden_test.sh
+
+  # T-4 and T-5 against versitygw, on both architectures.
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: juburr/melange-orb/actions/install@95a73caf0feebdd9b2480bf94ec64ca210f764b0 # v1.2.0
+      - name: Show the tool versions
+        run: |
+          python3 --version
+          openssl version
+          aws --version
+      - name: Start the S3 server
+        run: bash tests/s3_server.sh apk-repo-test
+      - name: Run the integration tests
+        env:
+          APK_REPO_BUCKET: apk-repo-test
+          RACE_ROUNDS: "20"
+        run: bash tests/integration_test.sh
+
+  # T-6: melange builds a package, the actions publish, pull and verify it,
+  # and apko builds an image from the pulled repository, which must run the
+  # package's script.
+  end-to-end:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: juburr/melange-orb/actions/install@95a73caf0feebdd9b2480bf94ec64ca210f764b0 # v1.2.0
+      - uses: juburr/apko-orb/actions/install@124ccd86c4c7b6356d1ec151b16cccae0601ddda # v1.1.0
+      - name: Start the S3 server
+        run: bash tests/s3_server.sh apk-repo-e2e
+      - name: Make the keys and build the package
+        run: |
+          melange keygen build.rsa
+          melange keygen apk-repo-test.rsa
+          mkdir -p keyring
+          mv apk-repo-test.rsa.pub keyring/
+          delimiter="ghadelimiter_$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+          printf 'APK_SIGNING_KEY<<%s\n%s\n%s\n' "${delimiter}" "$(cat apk-repo-test.rsa)" "${delimiter}" >> "${GITHUB_ENV}"
+          rm apk-repo-test.rsa
+          melange build tests/fixtures/melange.yaml --runner docker --arch "$(uname -m)" \
+            --signing-key build.rsa --out-dir packages
+      - id: publish
+        uses: ./actions/publish
+        with:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          key_name: apk-repo-test.rsa
+          allow_create: "true"
+      - name: Check the publish receipt
+        env:
+          RECEIPT: ${{ steps.publish.outputs.receipt }}
+        run: |
+          [[ "${RECEIPT}" == "${GITHUB_WORKSPACE}/apk-repo-receipt.json" ]]
+          [[ "${APK_REPO_RECEIPT}" == "${RECEIPT}" ]]
+          python3 -I - "${RECEIPT}" "$(uname -m)" << 'EOF'
+          import json, sys
+          receipt, arch = json.load(open(sys.argv[1])), sys.argv[2]
+          published = receipt["architectures"][arch]["published"]
+          assert published == ["apk-repo-hello-0.0.1-r0.apk"], published
+          assert receipt["architectures"][arch]["index"]["signature"] == ".SIGN.RSA256.apk-repo-test.rsa.pub"
+          print("Published", published)
+          EOF
+      - id: pull
+        uses: ./actions/pull
+        with:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          out_dir: pulled
+          receipt_path: pull-receipt.json
+      - uses: ./actions/verify
+        with:
+          dir: pulled
+          keyring: keyring
+          receipt_path: verify-receipt.json
+      - name: Check the pull and verify receipts
+        env:
+          PULL_RECEIPT: ${{ steps.pull.outputs.receipt }}
+        run: |
+          [[ "${PULL_RECEIPT}" == "${GITHUB_WORKSPACE}/pull-receipt.json" ]]
+          [[ -f verify-receipt.json ]]
+      - uses: juburr/apko-orb/actions/build@124ccd86c4c7b6356d1ec151b16cccae0601ddda # v1.1.0
+        with:
+          config: tests/fixtures/apko.yaml
+          image: apk-repo-e2e:latest
+          arch: host
+          log_level: info
+          output_path: image/e2e.tar
+      - name: Run the image
+        run: |
+          case "$(uname -m)" in
+            x86_64) tag=amd64 ;;
+            aarch64) tag=arm64 ;;
+          esac
+          docker load --input image/e2e.tar
+          OUTPUT=$(docker run --rm "apk-repo-e2e:latest-${tag}")
+          echo "${OUTPUT}"
+          if [[ "${OUTPUT}" != "hello from apk-repo-orb" ]]; then
+            echo "The image didn't run the pulled package's script."
+            exit 1
+          fi
