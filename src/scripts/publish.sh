@@ -437,6 +437,15 @@ adopt() {
     echo "${arch}: ${file} was already uploaded by an earlier publish that didn't finish; using it."
 }
 
+# sidecar_ok ARCH FILE OBJECT: whether AR_WORK/existing, found at the key of
+# OBJECT (FILE's .sha256 or its key_name signature), is acceptable though it
+# isn't the staged copy: only a signature that verifies over the staged
+# sidecar with key_name.pub, as one made earlier would. Anything else is
+# immutable and must not be replaced.
+sidecar_ok() {
+    [[ "$3" == *.sig ]] && ar_openssl_verify "${AR_KEYS[${KEY_NAME}]}" "${AR_WORK}/existing" "${AR_WORK}/stage/$1/$2.sha256"
+}
+
 # receipt_shas ARCH ENTRIES: the SHA-256 of every package ENTRIES lists, from
 # its sidecar, verified (S-4), for the receipt. Fetched before the index is
 # written, so nothing after that can fail, and kept across attempts.
@@ -531,6 +540,19 @@ publish_arch() {
                     "${AR_ABSENT}") ;;
                     *) ar_die "Access to $(ar_s3_url "${PREFIX}/${arch}/${file}") was denied." "$(ar_denied_hint "${PREFIX}/${arch}/${file}")" ;;
                 esac
+                for object in "${file}.sha256" "${file}.sha256.${KEY_NAME}.sig"; do
+                    status=0
+                    ar_get_object "${PREFIX}/${arch}/${object}" "${AR_WORK}/existing" || status=$?
+                    case "${status}" in
+                        0)
+                            if ! cmp -s -- "${AR_WORK}/existing" "${stage}/${object}" && ! sidecar_ok "${arch}" "${file}" "${object}"; then
+                                ar_die "$(ar_s3_url "${PREFIX}/${arch}/${object}") already exists with different contents; it is immutable."
+                            fi
+                            ;;
+                        "${AR_ABSENT}") ;;
+                        *) ar_die "Access to $(ar_s3_url "${PREFIX}/${arch}/${object}") was denied." "$(ar_denied_hint "${PREFIX}/${arch}/${object}")" ;;
+                    esac
+                done
             done
         else
             for file in ${new[@]+"${new[@]}"}; do
@@ -540,54 +562,65 @@ publish_arch() {
                 fi
                 for object in "${file}.sha256" "${file}.sha256.${KEY_NAME}.sig"; do
                     put_immutable "${PREFIX}/${arch}/${object}" "${stage}/${object}" application/octet-stream
-                    if [[ "${PUT_RESULT}" == "different" ]]; then
-                        if [[ "${object}" == *.sig ]] && ar_openssl_verify "${AR_KEYS[${KEY_NAME}]}" "${AR_WORK}/existing" "${stage}/${file}.sha256"; then
-                            continue
-                        fi
+                    if [[ "${PUT_RESULT}" == "different" ]] && ! sidecar_ok "${arch}" "${file}" "${object}"; then
                         ar_die "$(ar_s3_url "${PREFIX}/${arch}/${object}") already exists with different contents; it is immutable."
                     fi
                 done
             done
         fi
-        if [[ ${#new[@]} -eq 0 ]]; then
+        if [[ ${#new[@]} -eq 0 && "${creating}" == "true" ]]; then
+            ar_die "No ${arch} index exists, and there are no packages to create it with."
+        fi
+        if [[ ${#new[@]} -eq 0 && "${index_key}" == "${KEY_NAME}" ]]; then
             echo "${arch}: every package is already published; the index stays as it is."
-            if [[ "${creating}" == "true" ]]; then
-                ar_die "No ${arch} index exists, and there are no packages to create it with."
-            fi
             out="${remote}/APKINDEX.tar.gz"
             entries="${remote}/index/entries.tsv"
             receipt_shas "${arch}" "${entries}"
             break
         fi
-        # U-9: the merged index, written to a fresh path and checked.
         build="${AR_WORK}/build/${arch}/${attempt}"
         mkdir -p "${build}"
         out="${build}/APKINDEX.tar.gz"
-        local -a args=(index --output "${out}" --signing-key "${KEY_FILE}")
-        if [[ "${creating}" != "true" ]]; then
-            args+=(--merge --source "${remote}/APKINDEX.tar.gz")
-        fi
-        local -a paths=()
-        for file in "${new[@]}"; do
-            paths+=("${stage}/${file}")
-        done
-        if ! melange "${args[@]}" "${paths[@]}" > "${build}/melange.log" 2>&1; then
-            cat "${build}/melange.log" >&2
-            ar_die "melange index failed for ${arch}; its output is above."
-        fi
-        if [[ ! -s "${out}" ]]; then
-            ar_die "melange index wrote no ${arch} index."
+        if [[ ${#new[@]} -eq 0 ]]; then
+            # S-8: key_name changed, and the index is still signed with the
+            # old key. The same entries, signed with key_name.
+            echo "${arch}: every package is already published, but the index is signed with ${index_key}; signing it with ${KEY_NAME}."
+            if ! openssl dgst -sha256 -sign "${KEY_FILE}" -out "${build}/signature" "${remote}/index/signed"; then
+                ar_die "openssl couldn't sign the ${arch} index with ${KEY_NAME}."
+            fi
+            ar_py index-sign "${KEY_NAME}" "${build}/signature" "${remote}/index/signed" "${out}" || exit 1
+        else
+            # U-9: the merged index, written to a fresh path and checked.
+            local -a args=(index --output "${out}" --signing-key "${KEY_FILE}")
+            if [[ "${creating}" != "true" ]]; then
+                args+=(--merge --source "${remote}/APKINDEX.tar.gz")
+            fi
+            local -a paths=()
+            for file in "${new[@]}"; do
+                paths+=("${stage}/${file}")
+            done
+            if ! melange "${args[@]}" "${paths[@]}" > "${build}/melange.log" 2>&1; then
+                cat "${build}/melange.log" >&2
+                ar_die "melange index failed for ${arch}; its output is above."
+            fi
+            if [[ ! -s "${out}" ]]; then
+                ar_die "melange index wrote no ${arch} index."
+            fi
         fi
         ar_verify_index "${out}" "${arch}" "${build}/index"
         if [[ "${AR_INDEX_KEY}" != "${KEY_NAME}" ]]; then
             ar_die "The new ${arch} index is signed with ${AR_INDEX_KEY}, not ${KEY_NAME}."
         fi
-        check_merge "${arch}" "${remote}/index/entries.tsv" "${build}/index/entries.tsv" "${new[@]}"
+        check_merge "${arch}" "${remote}/index/entries.tsv" "${build}/index/entries.tsv" ${new[@]+"${new[@]}"}
         index_key=${KEY_NAME}
         entries="${build}/index/entries.tsv"
         receipt_shas "${arch}" "${entries}"
         if [[ "${DRY_RUN}" == "true" ]]; then
-            echo "${arch}: would publish ${new[*]}${skipped[0]:+ (already published: ${skipped[*]})}."
+            if [[ ${#new[@]} -eq 0 ]]; then
+                echo "${arch}: would sign the index with ${KEY_NAME}."
+            else
+                echo "${arch}: would publish ${new[*]}${skipped[0]:+ (already published: ${skipped[*]})}."
+            fi
             etag=""
             version_id=""
             break
@@ -599,7 +632,7 @@ publish_arch() {
             0)
                 etag=${AR_ETAG}
                 version_id=${AR_VERSION_ID}
-                echo "${arch}: published ${new[*]} ($(ar_s3_url "${key}") is now ETag ${etag})."
+                echo "${arch}: published ${new[*]:-no new packages} ($(ar_s3_url "${key}") is now ETag ${etag}, signed with ${KEY_NAME})."
                 break
                 ;;
             "${AR_PRECONDITION}" | "${AR_CONFLICT}" | "${AR_ABSENT}")
@@ -648,6 +681,8 @@ check_merge() {
             ar_die "melange's merged index changed or dropped ${name} ${version}; refusing to publish it."
         fi
     done < "${remote}"
+    # Bash 4.0 takes an empty "$@" for an unbound variable.
+    [[ $# -gt 0 ]] || return 0
     for file in "$@"; do
         read -r arch size checksum digest <<< "${have[${file}]:-}"
         if [[ "${size}" != "${PKG_SIZE[${target}/${file}]}" || "${checksum}" != "${PKG_CHECKSUM[${target}/${file}]}" ]]; then

@@ -701,6 +701,53 @@ publish_new PARAM_DRY_RUN=true
 check "U-13: a dry run finds a different build at the key" failed
 check "saying packages are immutable" said "already exists with different contents; packages are immutable"
 
+begin "U-13: what an earlier publish left at a new package's sidecar"
+new_case
+package x86_64 hello 1.0.0-r0
+printf 'junk\n' > "${CASE}/junk.sha256"
+s3_put test/os/x86_64/hello-1.0.0-r0.apk.sha256 "${CASE}/junk.sha256"
+publish_new PARAM_DRY_RUN=true
+check "a dry run finds a different .sha256" failed
+check "saying it is immutable" said "hello-1.0.0-r0.apk.sha256 already exists with different contents; it is immutable."
+publish_new
+check "as the real run does" said "hello-1.0.0-r0.apk.sha256 already exists with different contents; it is immutable."
+
+begin "S-8: rotating the signing key"
+new_case
+package x86_64 hello 1.0.0-r0
+publish_new
+mkdir -p "${CASE}/rotation"
+cp "${WORK}/keys/test-apk.rsa.pub" "${WORK}/keys/other-apk.rsa.pub" "${CASE}/rotation/"
+run publish PARAM_KEYRING="${CASE}/rotation" PARAM_KEY_NAME=other-apk.rsa APK_SIGNING_KEY="$(cat "${WORK}/keys/other-apk.rsa")" PARAM_DRY_RUN=true
+check "a dry run with the new key_name and nothing new would sign the index" said "would sign the index with other-apk.rsa"
+run publish PARAM_KEYRING="${CASE}/rotation" PARAM_KEY_NAME=other-apk.rsa APK_SIGNING_KEY="$(cat "${WORK}/keys/other-apk.rsa")"
+check "the real run succeeds" succeeded
+check "signing the unchanged index with the new key" json_is "${CASE}/apk-repo-receipt.json" 'r["architectures"]["x86_64"]["index"]["signature"], r["architectures"]["x86_64"]["published"]' "('.SIGN.RSA256.other-apk.rsa.pub', [])"
+check "with If-Match" logged '^PutObject test/os/x86_64/APKINDEX.tar.gz if-match'
+run pull PARAM_OUT_DIR=pulled PARAM_KEYRING="${CASE}/rotation"
+check "pull reads it with both keys in the keyring" succeeded
+: > "${CASE}/aws.log"
+run publish PARAM_KEYRING="${CASE}/rotation" PARAM_KEY_NAME=other-apk.rsa APK_SIGNING_KEY="$(cat "${WORK}/keys/other-apk.rsa")"
+check "a second publish leaves it as it is" not_logged '^PutObject test/os/x86_64/APKINDEX.tar.gz'
+
+begin "S-6: a sparse entry in an archive"
+new_case
+python3 -I - "${CASE}/sparse.tar.gz" << 'EOF'
+# An index whose signature tar holds a GNU sparse entry claiming 1 GiB.
+import gzip, sys, tarfile
+info = tarfile.TarInfo(".SIGN.RSA256.test-apk.rsa.pub")
+info.type = tarfile.GNUTYPE_SPARSE
+header = bytearray(info.tobuf(tarfile.GNU_FORMAT, "utf-8", "strict"))
+header[483:495] = b"%011o\0" % (1 << 30)
+header[148:156] = b"        "
+header[148:156] = b"%06o\0 " % sum(header)
+open(sys.argv[1], "wb").write(gzip.compress(bytes(header)) + gzip.compress(b"\0" * 1024))
+EOF
+RC=0
+OUTPUT=$(python3 -I "${ROOT}/src/scripts/apk_repo.py" index-split "${CASE}/sparse.tar.gz" "${CASE}" 2>&1) || RC=$?
+check "is refused before its contents are read" exited 1
+check "as not a plain regular file" said "which is not a plain regular file"
+
 begin "V-6: a signature that doesn't verify beside one that does"
 new_case
 package x86_64 hello 1.0.0-r0

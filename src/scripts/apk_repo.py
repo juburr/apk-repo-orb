@@ -18,6 +18,11 @@ Commands:
       (every byte after the signature member: what the signature covers),
       and prints the signing key's name (KEY in .SIGN.RSA256.KEY.pub).
 
+  index-sign KEY SIGNATURE SIGNED OUT
+      Writes OUT, an index whose signature member holds SIGNATURE as
+      .SIGN.RSA256.KEY.pub, followed by SIGNED (the bytes it signs), as
+      melange does: how publish signs an unchanged index with a new key.
+
   index-entries FILE ARCH WORKDIR
       Reads WORKDIR/signed, split from FILE (named in messages) once its
       signature has verified, and writes
@@ -42,6 +47,7 @@ stderr), 2 usage.
 """
 
 import base64
+import gzip
 import hashlib
 import io
 import json
@@ -138,8 +144,13 @@ def tar_files(data, what):
         for member in archive:
             if member.isdir():
                 continue
-            if not member.isreg():
-                raise Refused("%s holds %s, which is not a regular file" % (what, member.name))
+            if not member.isreg() or member.issparse():
+                raise Refused("%s holds %s, which is not a plain regular file" % (what, member.name))
+            # A regular entry's bytes are in the archive, so it can't claim
+            # more than that; reading a bigger one would allocate its size.
+            if member.size > len(data):
+                raise Refused("%s holds %s, which claims %d bytes in a %d-byte archive"
+                              % (what, member.name, member.size, len(data)))
             files.append((member.name, archive.extractfile(member).read()))
     except tarfile.TarError as error:
         raise Refused("%s is not a valid tar archive: %s" % (what, error))
@@ -218,6 +229,23 @@ def command_index_split(path, workdir):
     write(os.path.join(workdir, "signature"), signature)
     write(os.path.join(workdir, "signed"), signed)
     print(key)
+
+
+def command_index_sign(key, signature_path, signed_path, out):
+    if not KEY_RE.fullmatch(key):
+        raise Refused("%s is not a key name such as my-org-apk.rsa" % key)
+    with open(signature_path, "rb") as stream:
+        signature = stream.read()
+    with open(signed_path, "rb") as stream:
+        signed = stream.read()
+    info = tarfile.TarInfo(SIGN_PREFIX + key + ".pub")
+    info.size = len(signature)
+    info.mode = 0o644
+    # The signature tar ends after its one entry, with no end-of-archive
+    # blocks, as apk-tools and melange write it.
+    member = info.tobuf(tarfile.USTAR_FORMAT, "utf-8", "strict") + signature \
+        + b"\0" * ((512 - len(signature) % 512) % 512)
+    write(out, gzip.compress(member, mtime=0) + signed)
 
 
 def command_index_entries(path, arch, workdir):
@@ -402,9 +430,11 @@ def write(path, data):
 
 def main(argv):
     commands = {"index-split": (command_index_split, 2), "index-entries": (command_index_entries, 3),
+                "index-sign": (command_index_sign, 4),
                 "apk": (command_apk, 2), "receipt": (command_receipt, 2)}
     if len(argv) < 2 or argv[1] not in commands or len(argv) - 2 != commands[argv[1]][1]:
         sys.stderr.write("ERROR: usage: apk_repo.py index-split FILE WORKDIR | index-entries FILE ARCH WORKDIR"
+                         " | index-sign KEY SIGNATURE SIGNED OUT"
                          " | apk FILE WORKDIR | receipt OUT WORKDIR\n")
         return 2
     function, _ = commands[argv[1]]
