@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logos/apk-repo-orb-512px.png" width="256" alt="apk-repo-orb logo: a green robot courier carrying a box labeled APK across a green alien landscape">
+<img src="assets/logos/apk-repo-orb-512px.png" width="256" alt="apk-repo-orb logo: a green alien carrying a box labeled APK past a warehouse of APK boxes on a green planet">
 
 # APK Repositories in S3 for CircleCI and GitHub Actions
 
