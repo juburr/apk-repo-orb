@@ -30,7 +30,7 @@ set -euo pipefail
 # the PATH. AWS credentials come from the AWS CLI's own chain.
 #
 # Shared code: SCRIPT_APK_REPO_LIB and SCRIPT_APK_REPO_PY hold
-# lib/apk_repo.sh and apk_repo.py, from CircleCI's << include() >> or
+# lib/apk_repo.sh and apk_repo.py, from CircleCI's include directive or
 # actions/run_script.sh. A standalone run (bash src/scripts/pull.sh) reads
 # them from beside this script.
 
@@ -52,7 +52,7 @@ trap 'rm -rf "${AR_WORK}"' EXIT
 BACKEND=$(ar_subst "${PARAM_BACKEND:-s3}")
 BUCKET=$(ar_subst "${PARAM_BUCKET:-}")
 PREFIX=$(ar_subst "${PARAM_PREFIX:-}")
-ENDPOINT_URL=$(ar_subst "${PARAM_ENDPOINT_URL:-}")
+ENDPOINT_URL=$(ar_configured_endpoint "$(ar_subst "${PARAM_ENDPOINT_URL:-}")")
 REGION=$(ar_subst "${PARAM_REGION:-}")
 ARCH=$(ar_subst "${PARAM_ARCH:-}")
 KEYRING=$(ar_subst "${PARAM_KEYRING:-}")
@@ -65,7 +65,9 @@ ar_check_bucket "${BUCKET}"
 ar_check_prefix "${PREFIX}"
 ar_check_endpoint "${ENDPOINT_URL}"
 ar_check_region "${REGION}"
-ar_arches "${ARCH:-$(ar_machine_arch)}"
+ARCH=$(ar_default_arch "${ARCH}") || exit $?
+ar_arches "${ARCH}"
+ar_check_receipt_path "${RECEIPT_PATH}"
 if [[ -z "${OUT_DIR}" ]]; then
     ar_usage "out_dir is required."
 fi
@@ -162,11 +164,20 @@ for arch in "${AR_ARCHES[@]}"; do
     mv -- "${AR_WORK}/stage/${arch}" "${OUT_DIR}/${arch}"
     if [[ -n "${CACHE_DIR}" ]]; then
         mkdir -p -- "${CACHE_DIR}/${arch}"
-        for package in "${OUT_DIR}/${arch}"/*.apk; do
-            [[ -f "${package}" ]] || continue
-            cp -- "${package}" "${CACHE_DIR}/${arch}/.$(basename -- "${package}").partial"
-            mv -- "${CACHE_DIR}/${arch}/.$(basename -- "${package}").partial" "${CACHE_DIR}/${arch}/$(basename -- "${package}")"
-        done
+        if [[ -L "${CACHE_DIR}/${arch}" ]]; then
+            ar_warn "cache_dir ${CACHE_DIR}/${arch} is a symbolic link; leaving it as it is."
+        else
+            for package in "${OUT_DIR}/${arch}"/*.apk; do
+                [[ -f "${package}" ]] || continue
+                target="${CACHE_DIR}/${arch}/$(basename -- "${package}")"
+                [[ -d "${target}" ]] && continue
+                # A new file of our own, renamed into place: a symbolic link
+                # in a restored cache is replaced, never written through.
+                partial=$(mktemp "${CACHE_DIR}/${arch}/.partial.XXXXXX")
+                cp -- "${package}" "${partial}"
+                mv -f -- "${partial}" "${target}"
+            done
+        fi
     fi
     echo "Pulled $(ar_s3_url "${PREFIX}/${arch}") into ${OUT_DIR}/${arch}."
 done

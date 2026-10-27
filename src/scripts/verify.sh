@@ -22,7 +22,7 @@ set -euo pipefail
 # the PATH.
 #
 # Shared code: SCRIPT_APK_REPO_LIB and SCRIPT_APK_REPO_PY hold
-# lib/apk_repo.sh and apk_repo.py, from CircleCI's << include() >> or
+# lib/apk_repo.sh and apk_repo.py, from CircleCI's include directive or
 # actions/run_script.sh. A standalone run (bash src/scripts/verify.sh)
 # reads them from beside this script.
 
@@ -47,7 +47,9 @@ KEYRING=$(ar_subst "${PARAM_KEYRING:-}")
 RECEIPT_PATH=$(ar_subst "${PARAM_RECEIPT_PATH:-apk-repo-receipt.json}")
 
 ar_need_tools python3 openssl
-ar_arches "${ARCH:-$(ar_machine_arch)}"
+ARCH=$(ar_default_arch "${ARCH}") || exit $?
+ar_arches "${ARCH}"
+ar_check_receipt_path "${RECEIPT_PATH}"
 # shellcheck disable=SC2034 # filled and read by the lib
 declare -A AR_KEYS=()
 ar_keyring "${KEYRING}"

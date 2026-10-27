@@ -87,7 +87,7 @@ flowchart LR
 ```
 
 1. **`publish`** takes `packages/<arch>/*.apk` from `melange build`, re-signs each package with your production key (`melange sign`), and writes a SHA-256 sidecar for it, signed with the same key. It uploads the new packages and sidecars with `If-None-Match: *`, so nothing that exists is overwritten, then merges them into the bucket's index with `melange index --merge` and uploads that with `If-Match` on the ETag it read. If another publish changed the index in the meantime, it reads it again and merges again.
-2. **`pull`** reads the index, verifies its signature with your keyring, and downloads exactly the packages it lists, with their signed sidecars, into a private directory. Once every byte checks out, it moves them into `out_dir`, ready for apko as a file-path repository.
+2. **`pull`** reads the index, verifies its signature with your keyring, and downloads exactly the packages it lists, with their signed sidecars, into a private directory. Once every package checks out, it moves them into `out_dir`, ready for apko as a file-path repository.
 3. **`verify`** checks a local repository offline, with no network and no AWS CLI, against your keyring: the same checks `pull` makes.
 
 ## 🚀 Quick Start
@@ -220,7 +220,7 @@ The bucket holds a standard APK v2 repository that `apk` and apko understand, pl
 - **Signatures.** Only `.SIGN.RSA256.` (SHA-256) signatures are written or accepted; a legacy SHA-1 `.SIGN.RSA.` index fails verification.
 - **Why sidecars.** The index's per-package checksum (`C:`) is SHA-1 of the package's control segment. The sidecar gives each whole file a SHA-256, signed with the same key, and keeps the index the only object that ever changes. Its signature is named after the key, so after a key rotation new signatures can sit beside old ones.
 - **Metadata.** Immutable objects get `Content-Type: application/octet-stream` and `Cache-Control: max-age=31536000, immutable`; the index gets `application/gzip` and `no-cache`.
-- **Invariant.** Every package an index lists has its `.apk`, `.sha256` and a `.sig` in the bucket, since they are uploaded first. Objects no index lists (left by an interrupted publish) are allowed and ignored, and the next publish of the same build adopts them.
+- **Invariant.** Every package an index lists has its `.apk`, `.sha256` and a `.sig` in the bucket, since they are uploaded first. Objects no index lists (left by an interrupted publish) are allowed and ignored. The next publish of the same build adopts such a package when it is the same package signed with `key_name` alone; anything else at that key makes the version unusable, since nothing is ever overwritten.
 
 ## ⬆️ Publishing
 
@@ -237,7 +237,7 @@ The bucket holds a standard APK v2 repository that `apk` and apko understand, pl
 Architectures are published independently: one that fails doesn't undo another, and the step fails naming the ones that did. `dry_run` does everything but write, and reports what it would publish. The receipt (below) is written only when everything succeeds.
 
 > [!NOTE]
-> Publishing the same build twice is a no-op, so a re-run job is safe. A job that died after uploading packages but before the index leaves orphans; publishing the same build again adopts them.
+> Publishing the same build twice is a no-op, so a re-run job is safe. A job that died after uploading packages but before the index leaves orphans; publishing the same build again adopts them. `dry_run` reports an orphan it couldn't adopt, just as a real run would fail on it.
 
 ## ⬇️ Pulling and Verifying
 
@@ -546,7 +546,7 @@ The orb is a CI-side client; nothing serves the bucket. Should you want apko to 
 
 ### S3-compatible services
 
-Set `endpoint_url`. CI tests against [versitygw](https://github.com/versity/versitygw) v1.10.0, which enforces both conditions atomically, and the orb is built on Amazon S3's documented behavior; no test runs against Amazon S3 itself yet. Other services may work if `publish`'s probe passes, and it refuses those that ignore conditional writes. Services known to ignore them on `PutObject` include Garage, Zenko CloudServer and `rclone serve s3`.
+Set `endpoint_url`. When it is empty and the AWS CLI would take an endpoint from `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL`, the orb uses that one instead, checks it the same way (`https://`, or `http://` to localhost), and names it in the receipt; an `endpoint_url` in an AWS CLI profile isn't seen. CI tests against [versitygw](https://github.com/versity/versitygw) v1.10.0, which enforces both conditions atomically, and the orb is built on Amazon S3's documented behavior; no test runs against Amazon S3 itself yet. Other services may work if `publish`'s probe passes, and it refuses those that ignore conditional writes. Services known to ignore them on `PutObject` include Garage, Zenko CloudServer and `rclone serve s3`.
 
 The AWS CLI computes a CRC checksum for every upload by default, and `publish` also sends each upload's SHA-256 (`s3_checksums`). For a service that rejects checksum headers, set `s3_checksums: false` and these AWS CLI settings in the job's environment:
 
@@ -559,9 +559,9 @@ environment:
 ## 🔒 Secure by Design
 
 - **Trust only your keyring.** Signatures are checked against public keys from your checkout. A key from the bucket is never trusted, not even the one `publish_public_key` uploads.
-- **Verify before use.** `publish` verifies the bucket's index and the sidecars of packages it skips; `pull` verifies everything before anything reaches `out_dir`. Only RSA-SHA256 signatures are accepted.
+- **Verify before use.** `publish` verifies the bucket's index, and the sidecar of every package the new index lists, before it writes the index; `pull` verifies everything before anything reaches `out_dir`. An index's contents are only read once its signature verifies. Only RSA-SHA256 signatures by RSA keys are accepted. A sidecar needs one signature by a keyring key that verifies; one by another keyring key that doesn't is reported with a warning, since an immutable stray signature must not make a package unreadable for good.
 - **Nothing is deleted or overwritten.** The orb's only write is `aws s3api put-object` with `If-None-Match` or `If-Match`; it never calls `aws s3 cp`/`sync`, `delete-object` or any other mutating API. A test fails the build if one appears.
-- **The signing key.** It is passed only as the name of an environment variable, written to a private file (mode 0600, in a directory created with mode 0700) that the step removes when it ends, even after a failure, and never logged, put on a command line or written to a receipt. Scripts never enable xtrace.
+- **The signing key.** It is passed only as the name of an environment variable. `publish` writes it to a private file (mode 0600, in a directory created with mode 0700) that the step removes when it ends, even after a failure, then unsets the variable, so the AWS CLI and melange never inherit it. It is never logged, put on a command line or written to a receipt, and scripts never enable xtrace. An encrypted key fails at once rather than prompting. On GitHub Actions, the shared `actions/run_script.sh` also snapshots the step's environment, key included, into its own private temporary directory to find what the script exported, and removes it when the step ends.
 - **Untrusted archives.** Indexes and packages are parsed in memory with size limits; no path from an archive is ever written to disk.
 - **Least privilege.** No `sudo`, no AWS credential parameters (the CLI's standard chain, ideally [OIDC](#oidc-no-stored-aws-keys)), and no network access beyond the S3 endpoint and AWS STS.
 - **Privacy.** No usage data of any kind is collected or shipped back to the orb developer.
@@ -572,6 +572,11 @@ environment:
 2. Switch `key_name` and `APK_SIGNING_KEY` to the new key. Each architecture's next publish signs the index with it. Packages published before keep their embedded signature, which apko doesn't check, and a sidecar signed with the old key only.
 3. Optionally, sign the old packages' sidecars with the new key and upload the signatures as `<name>-<version>.apk.sha256.<new>.sig`, new objects beside the old ones (`If-None-Match: *`). There is no command for this in v0.1.0.
 4. Remove the old key from keyrings only once every index is signed with the new key and every package has a sidecar signature by it: `pull` and `verify` refuse a package without a sidecar signature by a keyring key.
+
+### What signatures can't tell you
+
+- **Freshness.** An index's signature proves who signed it, not that it is the latest. Someone who can write the bucket can put back an older signed index, or another prefix's index signed with the same key, and `pull` accepts it. Keep write access to the publishing role, turn on versioning, and compare the `etag` and `version_id` in receipts when it matters.
+- **The index's signature member.** As in every APK repository, the signature covers everything after the index's first gzip member, not that member's own header, so the index file's SHA-256 in a receipt identifies the bytes read, not a signed value. The packages are covered whole by their signed sidecars.
 
 > [!IMPORTANT]
 > **Info for security teams:** see [Network Access](#-network-access) for the hosts to allow on locked-down or self-hosted runners.

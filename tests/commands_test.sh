@@ -66,7 +66,10 @@ s3() { printf '%s\n' "${CASE}/s3/bucket/$1"; }
 STUBS="${WORK}/stubs"
 mkdir -p "${STUBS}" "${WORK}/keys" "${WORK}/keyring" "${WORK}/other-keyring"
 printf '#!/bin/sh\nexec python3 -I "%s/tests/fake_aws.py" "$@"\n' "${ROOT}" > "${STUBS}/aws"
-printf '#!/bin/sh\nexec python3 -I "%s/tests/apk_fixtures.py" "$@"\n' "${ROOT}" > "${STUBS}/melange"
+# The melange stand-in also notes any run that could see the signing key.
+# shellcheck disable=SC2016 # the stand-in expands it, not this script
+printf '#!/bin/sh\nif [ -n "${APK_SIGNING_KEY:-}" ]; then echo "$1" >> "%s/key-seen"; fi\nexec python3 -I "%s/tests/apk_fixtures.py" "$@"\n' \
+    "${WORK}" "${ROOT}" > "${STUBS}/melange"
 printf '#!/bin/sh\necho "$@" >> "%s/sleeps"\n' "${WORK}" > "${STUBS}/sleep"
 chmod +x "${STUBS}"/*
 FIXTURES="python3 -I ${ROOT}/tests/apk_fixtures.py"
@@ -630,6 +633,152 @@ rm "$(s3 test/os/x86_64/hello-1.0.0-r0.apk.sha256)"
 run pull PARAM_OUT_DIR=pulled
 check "F-12: a package without its sidecar fails" failed
 check "saying the repository is incomplete" said "The repository is incomplete"
+
+# ------------------------------------------------------------------ edges
+echo "=== edge cases"
+
+# s3_put KEY FILE: an object written into the case's bucket by someone
+# else, such as an earlier publish that didn't finish.
+s3_put() {
+    (cd "${CASE}" && env PATH="${STUBS}:${PATH}" FAKE_S3_DIR="${CASE}/s3" \
+        aws s3api put-object --bucket bucket --key "$1" --body "$2" --if-none-match "*" > /dev/null)
+}
+
+begin "E-1: an architecture list that comes out empty"
+new_case
+repo "${CASE}/repo" x86_64 hello 1.0.0-r0
+mkdir -p "${CASE}/riscv"
+printf '#!/bin/sh\necho riscv64\n' > "${CASE}/riscv/uname"
+chmod +x "${CASE}/riscv/uname"
+run verify PARAM_DIR=repo PARAM_ARCH=" "
+check "an arch of only spaces is the machine's own" json_is "${CASE}/apk-repo-receipt.json" 'list(r["architectures"])' "['x86_64']"
+run verify PARAM_DIR=repo PARAM_ARCH= PATH="${CASE}/riscv:${STUBS}:${PATH}"
+check "on a machine that is neither architecture, verify fails (2)" exited 2
+check "naming it" said "This machine is riscv64"
+check "and writes no receipt for nothing" not_said "Wrote the receipt"
+run pull PARAM_OUT_DIR=pulled PARAM_ARCH= PATH="${CASE}/riscv:${STUBS}:${PATH}"
+check "so does pull" exited 2
+
+begin "F-2: a prefix is checked as a whole"
+new_case
+package x86_64 hello 1.0.0-r0
+publish_new PARAM_PREFIX=$'ok\n../../other/os'
+check "a prefix with a newline is refused" exited 2
+check "before any AWS call" not_logged '.'
+
+begin "S-4: the index's receipt data is checked before it is written"
+new_case
+package x86_64 aaa 1.0-r0
+publish_new
+rm -rf "${CASE}/packages"
+package x86_64 bbb 1.0-r0
+before=$(sha256sum < "$(s3 test/os/x86_64/APKINDEX.tar.gz)")
+echo 'GetObject aaa-1.0-r0\.apk\.sha256$ 500 1' > "${CASE}/rules"
+run publish
+check "an old entry's sidecar that can't be read fails the publish" failed
+check "before the index is replaced" [ "$(sha256sum < "$(s3 test/os/x86_64/APKINDEX.tar.gz)")" == "${before}" ]
+: > "${CASE}/rules"
+run publish
+check "and the next publish succeeds" succeeded
+check "with both packages in its receipt" json_is "${CASE}/apk-repo-receipt.json" 'sorted(p["file"] for p in r["architectures"]["x86_64"]["packages"])' "['aaa-1.0-r0.apk', 'bbb-1.0-r0.apk']"
+
+begin "U-4, U-7: what an earlier publish left at a new package's key"
+new_case
+package x86_64 hello 1.0.0-r0
+# The package as melange built it, signed with the build key, never re-signed.
+s3_put test/os/x86_64/hello-1.0.0-r0.apk "${CASE}/packages/x86_64/hello-1.0.0-r0.apk"
+publish_new PARAM_DRY_RUN=true
+check "a dry run finds it" failed
+check "and says it isn't signed with key_name alone" said "signed as '.SIGN.RSA256.build.rsa.pub', not only by test-apk.rsa"
+publish_new
+check "a real run refuses to adopt it" failed
+check "and leaves no index" absent "$(s3 test/os/x86_64/APKINDEX.tar.gz)"
+new_case
+package x86_64 hello 1.0.0-r0
+package x86_64 hello 1.0.0-r0 "${CASE}/other" "another build"
+s3_put test/os/x86_64/hello-1.0.0-r0.apk "${CASE}/other/x86_64/hello-1.0.0-r0.apk"
+publish_new PARAM_DRY_RUN=true
+check "U-13: a dry run finds a different build at the key" failed
+check "saying packages are immutable" said "already exists with different contents; packages are immutable"
+
+begin "V-6: a signature that doesn't verify beside one that does"
+new_case
+package x86_64 hello 1.0.0-r0
+publish_new
+printf 'junk' > "${CASE}/junk.sig"
+s3_put test/os/x86_64/hello-1.0.0-r0.apk.sha256.other-apk.rsa.sig "${CASE}/junk.sig"
+mkdir -p "${CASE}/both"
+cp "${WORK}/keys/test-apk.rsa.pub" "${WORK}/keys/other-apk.rsa.pub" "${CASE}/both/"
+run pull PARAM_OUT_DIR=pulled PARAM_KEYRING="${CASE}/both"
+check "is a warning, not a failure" succeeded
+check "naming it, once" [ "$(grep -c "WARN: hello-1.0.0-r0.apk.sha256.other-apk.rsa.sig doesn't verify with other-apk.rsa.pub" <<< "${OUTPUT}")" -eq 1 ]
+
+begin "V-4: the signature is checked before the index is read"
+new_case
+repo "${CASE}/repo" x86_64 hello 1.0.0-r0
+${FIXTURES} index "${CASE}/repo/x86_64/APKINDEX.tar.gz" --key "${WORK}/keys/other-apk.rsa" "${CASE}/repo/x86_64/hello-1.0.0-r0.apk"
+run verify PARAM_DIR=repo
+check "an index by a key the keyring lacks fails on its key" said "the keyring has no other-apk.rsa.pub"
+
+begin "P-6: a symbolic link left in cache_dir"
+new_case
+package x86_64 hello 1.0.0-r0
+publish_new
+mkdir -p "${CASE}/cache/x86_64"
+echo "outside" > "${CASE}/outside"
+ln -s "${CASE}/outside" "${CASE}/cache/x86_64/.hello-1.0.0-r0.apk.partial"
+ln -s "${CASE}/outside" "${CASE}/cache/x86_64/hello-1.0.0-r0.apk"
+run pull PARAM_OUT_DIR=pulled PARAM_CACHE_DIR=cache
+check "pull succeeds" succeeded
+check "without writing through it" [ "$(cat "${CASE}/outside")" == "outside" ]
+check "replacing the cache entry with the package" cmp -s "${CASE}/cache/x86_64/hello-1.0.0-r0.apk" "${CASE}/pulled/x86_64/hello-1.0.0-r0.apk"
+
+begin "U-1, S-1: the signing key"
+new_case
+package x86_64 hello 1.0.0-r0
+rm -f "${WORK}/key-seen"
+publish_new
+check "melange never sees the key's variable" absent "${WORK}/key-seen"
+openssl genrsa -aes256 -passout pass:secret -out "${CASE}/encrypted.pem" 2048 2> /dev/null
+publish_new APK_SIGNING_KEY="$(cat "${CASE}/encrypted.pem")" < /dev/null
+check "an encrypted key fails at once (2)" exited 2
+check "saying it must be unencrypted" said "unencrypted RSA private key"
+openssl ecparam -name prime256v1 -genkey -noout -out "${CASE}/ec.pem" 2> /dev/null
+mkdir -p "${CASE}/ec"
+openssl ec -in "${CASE}/ec.pem" -pubout -out "${CASE}/ec/ec-key.rsa.pub" 2> /dev/null
+run verify PARAM_DIR=. PARAM_KEYRING="${CASE}/ec"
+check "a keyring key that isn't RSA is refused (2)" exited 2
+
+begin "D-3: the AWS CLI's own endpoint settings"
+new_case
+package x86_64 hello 1.0.0-r0
+publish_new AWS_ENDPOINT_URL=http://localhost:7777
+check "AWS_ENDPOINT_URL is used when endpoint_url is empty" logged ' http://localhost:7777$'
+check "and named in the receipt" json_is "${CASE}/apk-repo-receipt.json" 'r["endpoint_url"]' "http://localhost:7777"
+: > "${CASE}/aws.log"
+publish_new AWS_ENDPOINT_URL_S3=http://s3.example.com
+check "and checked like it: http:// to another host is refused" exited 2
+check "before any AWS call" not_logged '.'
+
+begin "O-1: receipt_path"
+new_case
+repo "${CASE}/repo" x86_64 hello 1.0.0-r0
+mkdir -p "${CASE}/receipts"
+run verify PARAM_DIR=repo PARAM_RECEIPT_PATH=receipts
+check "a directory is refused (2)" exited 2
+run verify PARAM_DIR=repo
+check "a receipt is readable by others, as the umask allows" [ "$(stat -c %a "${CASE}/apk-repo-receipt.json")" == "644" ]
+
+begin "U-6: a listed package that is missing"
+new_case
+package x86_64 hello 1.0.0-r0
+publish_new
+rm "$(s3 test/os/x86_64/hello-1.0.0-r0.apk)"
+rm -rf "${CASE}/packages"
+package x86_64 hello 1.0.0-r0 "${CASE}/packages" "another build"
+run publish
+check "fails" failed
+check "saying it is missing, not that it differs" said "is missing, though the index lists it"
 
 if [[ "${FAILURES}" -gt 0 ]]; then
     echo "${FAILURES} check(s) failed."

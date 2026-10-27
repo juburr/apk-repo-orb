@@ -63,7 +63,8 @@ APK v2 facts the code relies on:
 
 ### `apk_repo.py`
 
-- `index FILE ARCH WORKDIR`: splits the index, requires exactly one `.SIGN.RSA256.<key>.rsa.pub` entry, writes `signature`, `signed` and `entries.tsv` (`P V A S C digest`, the digest being the SHA-256 of the record's sorted lines), and prints the key's name. Checks names, versions, `A:`, `S:`, duplicates and the final blank line.
+- `index-split FILE WORKDIR`: requires exactly one `.SIGN.RSA256.<key>.rsa.pub` entry, writes `signature` and `signed` (every byte after the signature member, not decompressed) and prints the key's name.
+- `index-entries FILE ARCH WORKDIR`: run only after `signed` verified, so an unsigned file is never decompressed or parsed. Writes `entries.tsv` (`P V A S C digest`, the digest being the SHA-256 of the record's sorted lines). Checks names, versions, `A:`, `S:`, duplicates and the final blank line.
 - `apk FILE WORKDIR`: writes `control` and, with one signature, `signature`; prints TSV of `pkgname`, `pkgver`, `arch`, `signatures`, `checksum` (the `C:` the package needs), `control_sha256`, `data_sha256` and `size`.
 - `receipt OUT WORKDIR`: writes the JSON receipt from `meta.tsv` and `arch/<arch>/{index.tsv,packages.tsv,published,skipped_identical,attempts}`, atomically.
 
@@ -75,7 +76,8 @@ Archives are read member by member with `zlib.decompressobj(31)` and `tarfile` i
 - `ar_need_tools` and `ar_need_aws`: the AWS CLI must list `IfMatch` and `IfNoneMatch` in `s3api put-object --generate-cli-skeleton` (2.22.5 added `--if-match`; `AR_AWS_MIN_VERSION`).
 - Parameters: `ar_arches`, `ar_check_prefix`, `ar_check_bucket`, `ar_check_key_name`, `ar_check_backend`, `ar_check_endpoint` (https, or http to localhost; no credentials, query or fragment), `ar_check_region`.
 - Keyring: `ar_keyring` fills `AR_KEYS[<key>.rsa]=path` (scripts `declare -A AR_KEYS=()` first: bash 4.0 has no `declare -g`). Only `*.rsa.pub` PEM public keys.
-- Verification: `ar_verify_index FILE ARCH WORKDIR` (sets `AR_INDEX_KEY`), `ar_verify_sidecar DIR FILE` (sets `AR_SIDECAR_SHA256`; every signature present by a keyring key must verify, and at least one must exist), `ar_verify_packages DIR ARCH WORKDIR RECEIPT_DIR` (presence, sidecar, SHA-256, size, `C:`; warns about unlisted files).
+- Verification: `ar_verify_index FILE ARCH WORKDIR` (`index-split`, the keyring and openssl, then `index-entries`; sets `AR_INDEX_KEY`), `ar_verify_sidecar DIR FILE` (sets `AR_SIDECAR_SHA256`; at least one signature by a keyring key must verify, and others that don't are warned about once each, through `AR_SIG_WARNED`: a stray immutable `.sig` must not break a package for good), `ar_verify_packages DIR ARCH WORKDIR RECEIPT_DIR` (presence, sidecar, SHA-256, size, `C:`, `datahash`; warns about unlisted files).
+- `ar_default_arch` (run as `ARCH=$(ar_default_arch ...) || exit $?`: `ar_usage` in a command substitution only ends the subshell) and `ar_arches`, which refuses an empty list, so no command succeeds having checked no architecture. `ar_check_prefix` matches the whole value against one pattern (a newline can't split it). `ar_configured_endpoint` takes `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT_URL` when `endpoint_url` is empty, so it is checked and recorded too. `ar_check_receipt_path`. Keyring keys must be RSA (`openssl rsa -pubin`).
 - S3: `ar_aws_init`, `ar_get_object KEY OUT` and `ar_put_object KEY FILE TYPE CACHE CONDITION` (sets `AR_ETAG`, `AR_VERSION_ID`). Failures are classified from the CLI's error code (`ar_aws_status`): `AR_ABSENT` (404, NoSuchKey), `AR_DENIED` (403), `AR_PRECONDITION` (412), `AR_CONFLICT` (409); anything else is fatal. A 403 is never "absent": S3 answers 403 for a missing key without `s3:ListBucket`.
 - Receipts: `ar_receipt_meta`, `ar_write_receipt PATH` (also exports `APK_REPO_RECEIPT`).
 
@@ -85,15 +87,15 @@ Validates everything, writes the key (xtrace off, `umask 077`) and checks it mat
 
 1. Reads and verifies the remote index, or with `allow_create` starts from none (U-8).
 2. Splits staged packages into new and already listed; a listed one must be the same bytes or the same control and data segments (`same_package`, through `segments`), or it fails (U-6).
-3. Uploads new packages and sidecars with `put_immutable` (`If-None-Match: *`); an existing object that is the same package (an orphan of an interrupted publish) is adopted (U-7).
-4. Runs `melange index [--merge --source remote]`, verifies the result is signed with `key_name`, and `check_merge` requires exactly the remote entries, unchanged, plus the new ones with the staged packages' sizes and checksums (U-9).
+3. Uploads new packages and sidecars with `put_immutable` (`If-None-Match: *`). An existing object at a new package's key (an orphan of an interrupted publish) is adopted by `adopt` only if it is the same package, `resign` is on, and it is signed with `key_name` alone (`signed_by_key`, the U-4 check staging runs too); otherwise the version is immutable and the publish fails. A dry run makes the same check with a GET, without writing (U-7).
+4. Runs `melange index [--merge --source remote]`, verifies the result is signed with `key_name`, and `check_merge` requires exactly the remote entries, unchanged, plus the new ones with the staged packages' sizes and checksums (U-9). `receipt_shas` then fetches and verifies the sidecar of every listed package not seen yet (kept across attempts), so nothing after the index write can fail.
 5. Uploads the index with `If-Match` (or `If-None-Match: *` when creating), and on 412, 409 or 404 backs off (jittered, up to 30 s) and starts again, up to `max_attempts` (U-10).
 
-The receipt is written only if every architecture succeeded.
+`publish_arch` runs as `set +e; ( set -e; publish_arch ARCH ); status=$?; set -e`, not `if (publish_arch ...)`, which would turn errexit off inside it. The key is unset from the environment once it is in its file. The receipt is written only if every architecture succeeded.
 
 ### `pull.sh`
 
-Refuses a non-empty `out_dir/<arch>` before any download (P-1). Per architecture, reads the index (404: "There is no repository at ..."; 403: the `s3:ListBucket` hint), verifies it, fetches each listed package's sidecar and signatures by keyring keys (404 for a signature is fine), takes the package from `cache_dir` when its SHA-256 matches the signed sidecar or downloads it, and verifies the staged copy. Only when every architecture verified does it move them into `out_dir` and fill the cache. Never lists the bucket.
+Refuses a non-empty `out_dir/<arch>` before any download (P-1). Per architecture, reads the index (404: "There is no repository at ..."; 403: the `s3:ListBucket` hint), verifies it, fetches each listed package's sidecar and signatures by keyring keys (404 for a signature is fine), takes the package from `cache_dir` when its SHA-256 matches the signed sidecar or downloads it, and verifies the staged copy. Only when every architecture verified does it move them into `out_dir` and fill the cache, through a `mktemp` file renamed into place, so a symbolic link left in a restored cache is replaced rather than written through (a symlinked `cache_dir/<arch>` is left alone with a warning). Never lists the bucket.
 
 ### GitHub Actions (`actions/`)
 

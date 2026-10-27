@@ -45,7 +45,7 @@ set -euo pipefail
 # chain.
 #
 # Shared code: SCRIPT_APK_REPO_LIB and SCRIPT_APK_REPO_PY hold
-# lib/apk_repo.sh and apk_repo.py, from CircleCI's << include() >> or
+# lib/apk_repo.sh and apk_repo.py, from CircleCI's include directive or
 # actions/run_script.sh. A standalone run (bash src/scripts/publish.sh)
 # reads them from beside this script.
 
@@ -73,7 +73,7 @@ FIVE_GIB=$((5 * 1024 * 1024 * 1024))
 BACKEND=$(ar_subst "${PARAM_BACKEND:-s3}")
 BUCKET=$(ar_subst "${PARAM_BUCKET:-}")
 PREFIX=$(ar_subst "${PARAM_PREFIX:-}")
-ENDPOINT_URL=$(ar_subst "${PARAM_ENDPOINT_URL:-}")
+ENDPOINT_URL=$(ar_configured_endpoint "$(ar_subst "${PARAM_ENDPOINT_URL:-}")")
 REGION=$(ar_subst "${PARAM_REGION:-}")
 ARCH=$(ar_subst "${PARAM_ARCH:-}")
 KEYRING=$(ar_subst "${PARAM_KEYRING:-}")
@@ -95,6 +95,7 @@ ar_check_prefix "${PREFIX}"
 ar_check_endpoint "${ENDPOINT_URL}"
 ar_check_region "${REGION}"
 ar_check_key_name "${KEY_NAME}"
+ar_check_receipt_path "${RECEIPT_PATH}"
 if ! ar_match "${MAX_ATTEMPTS}" '^[1-9][0-9]?$'; then
     ar_usage "max_attempts must be a number from 1 to 99, not '${MAX_ATTEMPTS}'."
 fi
@@ -106,7 +107,7 @@ if [[ ! -d "${PACKAGES_DIR}" ]]; then
 fi
 
 # U-3: the architectures, and their packages.
-if [[ -n "${ARCH}" ]]; then
+if [[ -n "${ARCH//[[:space:]]/}" ]]; then
     ar_arches "${ARCH}"
 else
     found=""
@@ -120,10 +121,10 @@ else
             esac
         fi
     done
-    ar_arches "${found}"
-    if [[ ${#AR_ARCHES[@]} -eq 0 ]]; then
+    if [[ -z "${found}" ]]; then
         ar_usage "${PACKAGES_DIR} has no packages: publish takes melange's output, <packages_dir>/<arch>/*.apk."
     fi
+    ar_arches "${found}"
 fi
 
 # U-1: the tools, then the private key, in a private directory.
@@ -151,17 +152,21 @@ if ! grep -q -- '-----BEGIN' "${KEY_FILE}"; then
     fi
     mv -- "${KEY_FILE}.pem" "${KEY_FILE}"
 fi
-if ! openssl rsa -in "${KEY_FILE}" -noout 2> /dev/null; then
-    ar_usage "${SIGNING_KEY} doesn't hold an RSA private key in PEM form (melange keygen makes one)."
+# -passin pass: makes an encrypted key fail here instead of prompting.
+if ! openssl rsa -in "${KEY_FILE}" -passin pass: -noout 2> /dev/null; then
+    ar_usage "${SIGNING_KEY} doesn't hold an unencrypted RSA private key in PEM form (melange keygen makes one)."
 fi
 # melange reads only PKCS#1 keys (BEGIN RSA PRIVATE KEY), which OpenSSL 3
 # writes only when asked to; OpenSSL 1.1 has no -traditional and writes it
 # anyway.
-if ! (umask 077 && { openssl rsa -in "${KEY_FILE}" -traditional -out "${KEY_FILE}.pkcs1" 2> /dev/null \
-    || openssl rsa -in "${KEY_FILE}" -out "${KEY_FILE}.pkcs1" 2> /dev/null; }); then
+if ! (umask 077 && { openssl rsa -in "${KEY_FILE}" -passin pass: -traditional -out "${KEY_FILE}.pkcs1" 2> /dev/null \
+    || openssl rsa -in "${KEY_FILE}" -passin pass: -out "${KEY_FILE}.pkcs1" 2> /dev/null; }); then
     ar_die "openssl couldn't rewrite the private key in ${SIGNING_KEY} in PKCS#1 form, which melange needs."
 fi
 mv -- "${KEY_FILE}.pkcs1" "${KEY_FILE}"
+# The key is in KEY_FILE now; the tools this script runs (aws, melange,
+# python3, and whatever runs them) don't inherit it.
+unset -v "${SIGNING_KEY}"
 # U-2: it must be the key the keyring names, so no job signs with another.
 openssl rsa -in "${KEY_FILE}" -pubout -outform DER -out "${AR_WORK}/derived.der" 2> /dev/null
 if ! openssl rsa -pubin -in "${AR_KEYS[${KEY_NAME}]}" -outform DER -out "${AR_WORK}/keyring.der" 2> /dev/null \
@@ -175,6 +180,13 @@ ar_aws_init "${BUCKET}" "${ENDPOINT_URL}" "${REGION}"
 mkdir -p "${AR_WORK}/receipt"
 ar_receipt_meta tool_version "${AR_TOOL_VERSION}" operation publish dry_run "${DRY_RUN}" backend "${BACKEND}" \
     endpoint_url "${ENDPOINT_URL}" bucket "${BUCKET}" prefix "${PREFIX}" key_name "${KEY_NAME}" started "$(ar_now)"
+
+# signed_by_key: whether the package inspect read last is signed with
+# key_name alone, by a signature that verifies (U-4).
+signed_by_key() {
+    [[ "${INSPECT_SIGNATURES}" == ".SIGN.RSA256.${KEY_NAME}.pub" ]] \
+        && ar_openssl_verify "${AR_KEYS[${KEY_NAME}]}" "${AR_WORK}/inspect/signature" "${AR_WORK}/inspect/control"
+}
 
 # Staged copies: packages_dir is never modified, and its APKINDEX.tar.gz,
 # signed with a build-time key, is never read (U-17).
@@ -216,7 +228,9 @@ write_sidecars() {
     base=$(basename -- "${file}")
     PKG_SHA[${key}]=$(ar_sha256 "${file}")
     printf '%s  %s\n' "${PKG_SHA[${key}]}" "${base}" > "${file}.sha256"
-    openssl dgst -sha256 -sign "${KEY_FILE}" -out "${file}.sha256.${KEY_NAME}.sig" "${file}.sha256"
+    if ! openssl dgst -sha256 -sign "${KEY_FILE}" -out "${file}.sha256.${KEY_NAME}.sig" "${file}.sha256"; then
+        ar_die "openssl couldn't sign ${base}.sha256 with ${KEY_NAME}."
+    fi
 }
 
 for arch in "${AR_ARCHES[@]}"; do
@@ -252,11 +266,9 @@ for arch in "${AR_ARCHES[@]}"; do
         fi
         for package in "${stage}"/*.apk; do
             inspect "${package}"
-            if [[ "${INSPECT_SIGNATURES}" != ".SIGN.RSA256.${KEY_NAME}.pub" ]]; then
-                ar_die "After melange sign, ${package##*/} is signed as '${INSPECT_SIGNATURES}', not only .SIGN.RSA256.${KEY_NAME}.pub."
-            fi
-            if ! ar_openssl_verify "${AR_KEYS[${KEY_NAME}]}" "${AR_WORK}/inspect/signature" "${AR_WORK}/inspect/control"; then
-                ar_die "After melange sign, ${package##*/}'s signature doesn't verify with ${KEY_NAME}.pub."
+            if ! signed_by_key; then
+                ar_die "After melange sign, ${package##*/} is signed as '${INSPECT_SIGNATURES}', not only by ${KEY_NAME}," \
+                    "or its signature doesn't verify with ${KEY_NAME}.pub."
             fi
         done
     fi
@@ -399,6 +411,46 @@ same_package() {
     [[ -n "${a}" && "${a}" == "${b}" ]]
 }
 
+# adopt ARCH FILE: FILE's key already holds AR_WORK/existing, which isn't
+# the staged package: left by a publish that never reached the index (U-7).
+# It is used instead of the staged copy only when it is the same package,
+# signed with key_name alone (U-4), so a sidecar never vouches for another
+# signature; anything else is immutable and fails.
+adopt() {
+    local arch=$1 file=$2 stage="${AR_WORK}/stage/$1" url
+    url=$(ar_s3_url "${PREFIX}/${arch}/${file}")
+    if ! same_package "${AR_WORK}/existing" "${stage}/${file}"; then
+        ar_die "${url} already exists with different contents; packages are immutable." \
+            "Publish this build under a new version or epoch (-r<N>)."
+    fi
+    if [[ "${RESIGN}" != "true" ]]; then
+        ar_die "${url} already exists, the same package signed differently, and resign is off; packages are immutable." \
+            "Publish with resign, or under a new version or epoch (-r<N>)."
+    fi
+    cp -- "${AR_WORK}/existing" "${stage}/${file}"
+    inspect "${stage}/${file}"
+    if ! signed_by_key; then
+        ar_die "${url} already exists, the same package signed as '${INSPECT_SIGNATURES}', not only by ${KEY_NAME}; packages are immutable." \
+            "Publish this build under a new version or epoch (-r<N>)."
+    fi
+    write_sidecars "${stage}/${file}"
+    echo "${arch}: ${file} was already uploaded by an earlier publish that didn't finish; using it."
+}
+
+# receipt_shas ARCH ENTRIES: the SHA-256 of every package ENTRIES lists, from
+# its sidecar, verified (S-4), for the receipt. Fetched before the index is
+# written, so nothing after that can fail, and kept across attempts.
+receipt_shas() {
+    local arch=$1 name version file
+    while IFS=$'\t' read -r name version _; do
+        file="${name}-${version}.apk"
+        if [[ -z "${PKG_SHA[${arch}/${file}]:-}" ]]; then
+            remote_sidecar "${arch}" "${file}" "${AR_WORK}/receipt-sidecars/${arch}"
+            PKG_SHA[${arch}/${file}]=${AR_SIDECAR_SHA256}
+        fi
+    done < "$2"
+}
+
 # publish_arch ARCH: the compare-and-swap loop for one architecture (U-6 to
 # U-10). Runs in a subshell, so a failure ends only this architecture.
 publish_arch() {
@@ -450,7 +502,13 @@ publish_arch() {
             if [[ "${AR_SIDECAR_SHA256}" != "${PKG_SHA[${arch}/${file}]}" ]]; then
                 status=0
                 ar_get_object "${PREFIX}/${arch}/${file}" "${remote}/packages/${file}" || status=$?
-                if [[ "${status}" -ne 0 || "$(ar_sha256 "${remote}/packages/${file}")" != "${AR_SIDECAR_SHA256}" ]] \
+                case "${status}" in
+                    0) ;;
+                    "${AR_ABSENT}") ar_die "$(ar_s3_url "${PREFIX}/${arch}/${file}") is missing, though the index lists it." \
+                        "The repository is incomplete; restore the object, or publish under a new version or epoch (-r<N>)." ;;
+                    *) ar_die "Access to $(ar_s3_url "${PREFIX}/${arch}/${file}") was denied." "$(ar_denied_hint "${PREFIX}/${arch}/${file}")" ;;
+                esac
+                if [[ "$(ar_sha256 "${remote}/packages/${file}")" != "${AR_SIDECAR_SHA256}" ]] \
                     || ! same_package "${remote}/packages/${file}" "${package}"; then
                     ar_die "$(ar_s3_url "${PREFIX}/${arch}/${file}") is already published with different contents; packages are immutable." \
                         "Publish this build under a new version or epoch (-r<N>)."
@@ -463,18 +521,22 @@ publish_arch() {
         unset listed
         # U-7: the new packages' objects before the index, so no index ever
         # lists a package that isn't there.
-        if [[ "${DRY_RUN}" != "true" ]]; then
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            # What a real run would find at the new packages' keys.
+            for file in ${new[@]+"${new[@]}"}; do
+                status=0
+                ar_get_object "${PREFIX}/${arch}/${file}" "${AR_WORK}/existing" || status=$?
+                case "${status}" in
+                    0) cmp -s -- "${AR_WORK}/existing" "${stage}/${file}" || adopt "${arch}" "${file}" ;;
+                    "${AR_ABSENT}") ;;
+                    *) ar_die "Access to $(ar_s3_url "${PREFIX}/${arch}/${file}") was denied." "$(ar_denied_hint "${PREFIX}/${arch}/${file}")" ;;
+                esac
+            done
+        else
             for file in ${new[@]+"${new[@]}"}; do
                 put_immutable "${PREFIX}/${arch}/${file}" "${stage}/${file}" application/octet-stream
                 if [[ "${PUT_RESULT}" == "different" ]]; then
-                    # Left by an earlier publish that never reached the index.
-                    if ! same_package "${AR_WORK}/existing" "${stage}/${file}"; then
-                        ar_die "$(ar_s3_url "${PREFIX}/${arch}/${file}") already exists with different contents; packages are immutable." \
-                            "Publish this build under a new version or epoch (-r<N>)."
-                    fi
-                    cp -- "${AR_WORK}/existing" "${stage}/${file}"
-                    inspect "${stage}/${file}"
-                    write_sidecars "${stage}/${file}"
+                    adopt "${arch}" "${file}"
                 fi
                 for object in "${file}.sha256" "${file}.sha256.${KEY_NAME}.sig"; do
                     put_immutable "${PREFIX}/${arch}/${object}" "${stage}/${object}" application/octet-stream
@@ -494,6 +556,7 @@ publish_arch() {
             fi
             out="${remote}/APKINDEX.tar.gz"
             entries="${remote}/index/entries.tsv"
+            receipt_shas "${arch}" "${entries}"
             break
         fi
         # U-9: the merged index, written to a fresh path and checked.
@@ -522,6 +585,7 @@ publish_arch() {
         check_merge "${arch}" "${remote}/index/entries.tsv" "${build}/index/entries.tsv" "${new[@]}"
         index_key=${KEY_NAME}
         entries="${build}/index/entries.tsv"
+        receipt_shas "${arch}" "${entries}"
         if [[ "${DRY_RUN}" == "true" ]]; then
             echo "${arch}: would publish ${new[*]}${skipped[0]:+ (already published: ${skipped[*]})}."
             etag=""
@@ -558,10 +622,6 @@ publish_arch() {
     : > "${receipt}/packages.tsv"
     while IFS=$'\t' read -r name version _ size _; do
         file="${name}-${version}.apk"
-        if [[ -z "${PKG_SHA[${arch}/${file}]:-}" ]]; then
-            remote_sidecar "${arch}" "${file}" "${AR_WORK}/receipt-sidecars/${arch}"
-            PKG_SHA[${arch}/${file}]=${AR_SIDECAR_SHA256}
-        fi
         printf '%s\t%s\t%s\t%s\t%s\n' "${name}" "${version}" "${file}" "${PKG_SHA[${arch}/${file}]}" "${size}" >> "${receipt}/packages.tsv"
     done < "${entries}"
     printf '%s\n' ${new[@]+"${new[@]}"} > "${receipt}/published"
@@ -612,7 +672,16 @@ fi
 published=()
 failed=()
 for arch in "${AR_ARCHES[@]}"; do
-    if (publish_arch "${arch}"); then
+    # Not "if (publish_arch ...)": bash ignores errexit inside a condition,
+    # so the subshell sets it itself, outside one.
+    set +e
+    (
+        set -e
+        publish_arch "${arch}"
+    )
+    status=$?
+    set -e
+    if [[ "${status}" -eq 0 ]]; then
         published+=("${arch}")
     else
         failed+=("${arch}")

@@ -12,13 +12,17 @@ from an archive: members are read into memory, within the limits below.
 
 Commands:
 
-  index FILE ARCH WORKDIR
-      Splits a signed APKINDEX.tar.gz. Writes WORKDIR/signature (the
-      signature's bytes), WORKDIR/signed (every byte after the signature
-      member: what the signature covers) and WORKDIR/entries.tsv, one
-      line per package: P, V, A, S, C and a digest of the entry's fields,
-      tab-separated. Prints the signing key's name (KEY in
-      .SIGN.RSA256.KEY.pub).
+  index-split FILE WORKDIR
+      Splits a signed APKINDEX.tar.gz without reading what it signs.
+      Writes WORKDIR/signature (the signature's bytes) and WORKDIR/signed
+      (every byte after the signature member: what the signature covers),
+      and prints the signing key's name (KEY in .SIGN.RSA256.KEY.pub).
+
+  index-entries FILE ARCH WORKDIR
+      Reads WORKDIR/signed, split from FILE (named in messages) once its
+      signature has verified, and writes
+      WORKDIR/entries.tsv, one line per package: P, V, A, S, C and a
+      digest of the entry's fields, tab-separated.
 
   apk FILE WORKDIR
       Reads a package. Writes WORKDIR/control (its control segment, which
@@ -194,9 +198,7 @@ def parse_apkindex(text, path, arch):
     return entries
 
 
-def command_index(path, arch, workdir):
-    if arch not in ARCHES:
-        raise Refused("%s is not an architecture this orb handles" % arch)
+def command_index_split(path, workdir):
     if os.path.getsize(path) > INDEX_LIMIT:
         raise Refused("%s is more than %d bytes" % (path, INDEX_LIMIT))
     with open(path, "rb") as stream:
@@ -213,6 +215,19 @@ def command_index(path, arch, workdir):
         raise Refused("%s is signed as %s; only .SIGN.RSA256.<key>.rsa.pub signatures are accepted" % (path, name))
     if not signed:
         raise Refused("%s has nothing after its signature" % path)
+    write(os.path.join(workdir, "signature"), signature)
+    write(os.path.join(workdir, "signed"), signed)
+    print(key)
+
+
+def command_index_entries(path, arch, workdir):
+    # Only ever run on bytes whose signature has verified, so an unsigned
+    # file is never decompressed or parsed (it could be made to take
+    # gigabytes of memory within INDEX_LIMIT).
+    if arch not in ARCHES:
+        raise Refused("%s is not an architecture this orb handles" % arch)
+    with open(os.path.join(workdir, "signed"), "rb") as stream:
+        signed = stream.read()
     members = dict(tar_files(inflate_all(signed, INDEX_LIMIT, path), path))
     if "APKINDEX" not in members:
         raise Refused("%s has no APKINDEX file" % path)
@@ -225,11 +240,8 @@ def command_index(path, arch, workdir):
     if text.strip() and not text.endswith("\n\n"):
         raise Refused("%s's APKINDEX doesn't end with a blank line, so apko would drop its last entry" % path)
     entries = parse_apkindex(text, path, arch)
-    write(os.path.join(workdir, "signature"), signature)
-    write(os.path.join(workdir, "signed"), signed)
     write(os.path.join(workdir, "entries.tsv"),
           "".join("\t".join(entry) + "\n" for entry in entries).encode("utf-8"))
-    print(key)
 
 
 def parse_pkginfo(data, path):
@@ -389,9 +401,11 @@ def write(path, data):
 
 
 def main(argv):
-    commands = {"index": (command_index, 3), "apk": (command_apk, 2), "receipt": (command_receipt, 2)}
+    commands = {"index-split": (command_index_split, 2), "index-entries": (command_index_entries, 3),
+                "apk": (command_apk, 2), "receipt": (command_receipt, 2)}
     if len(argv) < 2 or argv[1] not in commands or len(argv) - 2 != commands[argv[1]][1]:
-        sys.stderr.write("ERROR: usage: apk_repo.py index FILE ARCH WORKDIR | apk FILE WORKDIR | receipt OUT WORKDIR\n")
+        sys.stderr.write("ERROR: usage: apk_repo.py index-split FILE WORKDIR | index-entries FILE ARCH WORKDIR"
+                         " | apk FILE WORKDIR | receipt OUT WORKDIR\n")
         return 2
     function, _ = commands[argv[1]]
     try:

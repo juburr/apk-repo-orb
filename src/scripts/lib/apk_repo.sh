@@ -3,8 +3,8 @@
 
 # Helpers shared by apk-repo-orb's scripts. It only defines functions and
 # variables: the scripts eval it, from SCRIPT_APK_REPO_LIB (CircleCI's
-# << include() >>, and actions/run_script.sh on GitHub Actions) or from
-# this file when they run standalone (ar_load in each script).
+# include directive, and actions/run_script.sh on GitHub Actions) or from
+# this file when they run standalone (see the top of each script).
 #
 # Functions that a script's caller may name a failure for return a status
 # instead of exiting: ar_get_object and ar_put_object return 0, or one of
@@ -27,6 +27,8 @@ AR_CONFLICT=6
 # The oldest AWS CLI v2 whose s3api put-object takes --if-match; 2.17.34
 # added --if-none-match.
 AR_AWS_MIN_VERSION="2.22.5"
+# Signatures ar_verify_sidecar has warned about, so each is reported once.
+declare -A AR_SIG_WARNED=()
 
 # ar_die MESSAGE...: prints an ERROR: line per argument and exits 1.
 ar_die() {
@@ -147,7 +149,8 @@ ar_machine_arch() {
 }
 
 # ar_arches VALUE: sets AR_ARCHES from a space-separated list of x86_64 and
-# aarch64, without repeats. An empty list is left empty.
+# aarch64, without repeats. An empty list is a usage error: a command that
+# checked no architecture must never succeed.
 ar_arches() {
     local arch
     AR_ARCHES=()
@@ -160,24 +163,34 @@ ar_arches() {
             AR_ARCHES+=("${arch}")
         fi
     done
+    if [[ ${#AR_ARCHES[@]} -eq 0 ]]; then
+        ar_usage "arch lists no architecture; give x86_64 and/or aarch64."
+    fi
 }
 
-# ar_check_prefix VALUE: F-2's prefix rule.
+# ar_default_arch VALUE: VALUE, or the machine's architecture when VALUE is
+# empty or only spaces. Run it as ARCH=$(ar_default_arch ...) || exit $?,
+# since ar_usage only ends the command substitution's subshell.
+ar_default_arch() {
+    if [[ -n "${1//[[:space:]]/}" ]]; then
+        printf '%s\n' "$1"
+    else
+        ar_machine_arch
+    fi
+}
+
+# ar_check_prefix VALUE: F-2's prefix rule, matched against the whole value
+# (so no newline, empty segment, leading or trailing /, or . or .. segment).
 ar_check_prefix() {
-    local segment
-    local -a segments
+    local segment=${AR_SEGMENT_RE#^}
+    segment=${segment%\$}
     if [[ -z "$1" ]]; then
         ar_usage "prefix is required, for example my-org/os."
     fi
-    if [[ "$1" == /* || "$1" == */ || "$1" == *//* ]]; then
-        ar_usage "prefix '$1' must not start or end with / or have an empty segment."
+    if ! ar_match "$1" "^${segment}(/${segment})*\$"; then
+        ar_usage "prefix '$1' must be /-separated segments of letters, digits, '.', '_' and '-', each starting with a letter or digit," \
+            "with no leading, trailing or doubled /."
     fi
-    IFS=/ read -r -a segments <<< "$1"
-    for segment in "${segments[@]}"; do
-        if [[ "${segment}" == ".." ]] || ! ar_match "${segment}" "${AR_SEGMENT_RE}"; then
-            ar_usage "prefix '$1' has a segment, '${segment}', that isn't letters, digits, '.', '_' and '-' starting with a letter or digit."
-        fi
-    done
 }
 
 ar_check_bucket() {
@@ -231,6 +244,27 @@ ar_check_endpoint() {
     fi
 }
 
+# ar_configured_endpoint VALUE: VALUE, or when it is empty the endpoint the
+# AWS CLI would take from AWS_ENDPOINT_URL_S3 or AWS_ENDPOINT_URL, so that
+# one is checked like endpoint_url and named in the receipt too.
+ar_configured_endpoint() {
+    if [[ -n "$1" || "${AWS_IGNORE_CONFIGURED_ENDPOINT_URLS:-}" == "true" ]]; then
+        printf '%s\n' "$1"
+    else
+        printf '%s\n' "${AWS_ENDPOINT_URL_S3:-${AWS_ENDPOINT_URL:-}}"
+    fi
+}
+
+# ar_check_receipt_path VALUE: a file to write, never a directory.
+ar_check_receipt_path() {
+    if [[ -z "$1" ]]; then
+        ar_usage "receipt_path is required."
+    fi
+    if [[ -d "$1" ]]; then
+        ar_usage "receipt_path $1 is a directory; give the path of the JSON file to write."
+    fi
+}
+
 ar_check_region() {
     if [[ -n "$1" ]] && ! ar_match "$1" '^[a-z0-9-]+$'; then
         ar_usage "region '$1' isn't a region name such as us-east-1."
@@ -279,8 +313,9 @@ ar_keyring_add() {
     if [[ "${base}" != *.rsa.pub ]] || ! ar_match "${key}" "${AR_KEY_RE}"; then
         ar_usage "keyring file $1 must be named <key>.rsa.pub, with <key> letters, digits, '.', '_' and '-'."
     fi
-    if ! openssl pkey -pubin -in "$1" -noout 2> /dev/null; then
-        ar_usage "keyring file $1 is not a PEM public key."
+    # apko only verifies RSA signatures, so another key type must not pass here.
+    if ! openssl rsa -pubin -in "$1" -noout 2> /dev/null; then
+        ar_usage "keyring file $1 is not a PEM RSA public key."
     fi
     if [[ -n "${AR_KEYS[${key}]:-}" ]] && ! cmp -s -- "${AR_KEYS[${key}]}" "$1"; then
         ar_usage "The keyring has two different files named ${base}: ${AR_KEYS[${key}]} and $1."
@@ -293,13 +328,13 @@ ar_openssl_verify() {
     openssl dgst -sha256 -verify "$1" -signature "$2" "$3" > /dev/null 2>&1
 }
 
-# ar_verify_index FILE ARCH WORKDIR: V-3 and V-4. Splits and checks the
-# signed index FILE for ARCH, leaving WORKDIR/entries.tsv (apk_repo.py's
-# index) and setting AR_INDEX_KEY to the key that signed it.
+# ar_verify_index FILE ARCH WORKDIR: V-3 and V-4. Splits the signed index
+# FILE for ARCH, verifies its signature, and only then reads its entries
+# into WORKDIR/entries.tsv. Sets AR_INDEX_KEY to the key that signed it.
 ar_verify_index() {
     local file=$1 arch=$2 work=$3
     mkdir -p "${work}"
-    AR_INDEX_KEY=$(ar_py index "${file}" "${arch}" "${work}") || exit 1
+    AR_INDEX_KEY=$(ar_py index-split "${file}" "${work}") || exit 1
     if [[ -z "${AR_KEYS[${AR_INDEX_KEY}]:-}" ]]; then
         ar_die "${file} is signed with ${AR_INDEX_KEY}, and the keyring has no ${AR_INDEX_KEY}.pub." \
             "Add ${AR_INDEX_KEY}.pub to keyring if you trust that key."
@@ -307,14 +342,18 @@ ar_verify_index() {
     if ! ar_openssl_verify "${AR_KEYS[${AR_INDEX_KEY}]}" "${work}/signature" "${work}/signed"; then
         ar_die "${file}'s signature doesn't verify with ${AR_KEYS[${AR_INDEX_KEY}]}: the index was changed, or signed with another key."
     fi
+    ar_py index-entries "${file}" "${arch}" "${work}" || exit 1
 }
 
 # ar_verify_sidecar DIR FILE: the FILE.sha256 sidecar in DIR is exactly the
 # line '<sha256>  FILE', and a signature on it by a keyring key verifies.
-# Sets AR_SIDECAR_SHA256 and AR_SIDECAR_KEYS (the keys whose signature
-# verified).
+# One that doesn't is only a warning when another does: signature objects
+# are immutable, so a stray one must not make the package unreadable for
+# good. Sets AR_SIDECAR_SHA256 and AR_SIDECAR_KEYS (the keys whose
+# signature verified).
 ar_verify_sidecar() {
     local dir=$1 file=$2 key signature
+    local -a failed=()
     if [[ ! -f "${dir}/${file}.sha256" || -L "${dir}/${file}.sha256" ]]; then
         ar_die "${dir}/${file}.sha256 is missing."
     fi
@@ -327,14 +366,24 @@ ar_verify_sidecar() {
     for key in ${AR_KEY_NAMES[@]+"${AR_KEY_NAMES[@]}"}; do
         signature="${dir}/${file}.sha256.${key}.sig"
         [[ -f "${signature}" ]] || continue
-        if ! ar_openssl_verify "${AR_KEYS[${key}]}" "${signature}" "${dir}/${file}.sha256"; then
-            ar_die "${signature} doesn't verify with ${AR_KEYS[${key}]}: the sidecar or its signature was changed."
+        if ar_openssl_verify "${AR_KEYS[${key}]}" "${signature}" "${dir}/${file}.sha256"; then
+            AR_SIDECAR_KEYS+=("${key}")
+        else
+            failed+=("${key}")
         fi
-        AR_SIDECAR_KEYS+=("${key}")
     done
     if [[ ${#AR_SIDECAR_KEYS[@]} -eq 0 ]]; then
+        if [[ ${#failed[@]} -gt 0 ]]; then
+            ar_die "${dir}/${file}.sha256.${failed[0]}.sig doesn't verify with ${failed[0]}.pub: the sidecar or its signature was changed."
+        fi
         ar_die "${dir}/${file}.sha256 has no signature by a keyring key (${file}.sha256.<key>.sig)."
     fi
+    for key in ${failed[@]+"${failed[@]}"}; do
+        if [[ -z "${AR_SIG_WARNED[${file}.${key}]:-}" ]]; then
+            AR_SIG_WARNED[${file}.${key}]=1
+            ar_warn "${file}.sha256.${key}.sig doesn't verify with ${key}.pub; ${file} is trusted for its signature by ${AR_SIDECAR_KEYS[0]}."
+        fi
+    done
 }
 
 # ar_verify_packages DIR ARCH WORKDIR RECEIPT_DIR: V-6 and V-7 for the
@@ -461,6 +510,9 @@ ar_put_object() {
     local -a options checksum=()
     if [[ "${AR_S3_CHECKSUMS:-true}" == "true" ]]; then
         checksum=(--checksum-sha256 "$(openssl dgst -sha256 -binary "${file}" | base64)")
+        if [[ "${checksum[1]}" != *= ]]; then
+            ar_die "Couldn't compute the SHA-256 of ${file} for S3 to check."
+        fi
     fi
     options=(${AR_AWS_OPTIONS[@]+"${AR_AWS_OPTIONS[@]}"} --bucket "${AR_BUCKET}" --key "${key}" --body "${file}"
         --content-type "$3" --cache-control "$4" ${checksum[@]+"${checksum[@]}"} --query '[ETag, VersionId]' --output text)
