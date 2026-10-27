@@ -1,0 +1,147 @@
+description: >
+  Publishes the packages melange built (packages_dir/<arch>/*.apk) to a
+  signed APK repository in an S3 bucket. It re-signs each package with your
+  production key, uploads it with a signed SHA-256 sidecar, then merges it
+  into the bucket's index and signs that. The index is only replaced if
+  nobody changed it in the meantime (If-Match), so concurrent publishers
+  never lose each other's packages, and published packages are never
+  overwritten or deleted. It first checks that the bucket enforces those
+  conditional writes. Writes a JSON receipt of what it published. Needs
+  melange (melange-orb's install command), the AWS CLI v2 (2.22.5 or
+  newer) with credentials, python3 (3.8 or newer) and the openssl CLI.
+parameters:
+  backend:
+    type: enum
+    enum: ["s3"]
+    default: s3
+    description: >
+      Where the repository is stored. Only s3 (Amazon S3 and S3-compatible
+      services) for now.
+  bucket:
+    type: string
+    description: >
+      The bucket that holds the repository. Environment variables are
+      expanded.
+  prefix:
+    type: string
+    description: >
+      The repository's key prefix in the bucket, such as my-org/os, with no
+      leading or trailing /. Its packages go to <prefix>/<arch>/.
+      Environment variables are expanded.
+  endpoint_url:
+    type: string
+    default: ""
+    description: >
+      An S3-compatible service's endpoint, passed as --endpoint-url. It must
+      be https://, or http:// to localhost, and enforce conditional writes.
+      Empty (the default) is AWS. Environment variables are expanded.
+  region:
+    type: string
+    default: ""
+    description: >
+      The bucket's region. Empty (the default) leaves it to the AWS CLI
+      (AWS_REGION, AWS_DEFAULT_REGION, its config). Environment variables
+      are expanded.
+  arch:
+    type: string
+    default: ""
+    description: >
+      Architectures to publish, space-separated: x86_64 and/or aarch64.
+      Empty (the default) is every packages_dir/<arch> that holds packages.
+      Environment variables are expanded.
+  keyring:
+    type: string
+    description: >
+      Public keys to trust, space-separated: files named <key>.rsa.pub, or
+      directories whose *.rsa.pub files are all trusted, from your
+      checkout. It must hold <key_name>.pub, which the private key has to
+      match, and the key of whatever signed the bucket's index. Environment
+      variables are expanded.
+  packages_dir:
+    type: string
+    default: packages
+    description: >
+      melange's --out-dir. Only its <arch>/*.apk files are read, and it is
+      never modified; its APKINDEX.tar.gz files are ignored. Environment
+      variables are expanded.
+  signing_key:
+    type: env_var_name
+    default: APK_SIGNING_KEY
+    description: >
+      Name of the environment variable that holds the PEM private key (or
+      the PEM base64-encoded), such as from a context. Never the key itself.
+  key_name:
+    type: string
+    description: >
+      The key's name, ending in .rsa, such as my-org-apk.rsa. Signatures are
+      named after it (.SIGN.RSA256.<key_name>.pub), and consumers' keyring
+      file must be <key_name>.pub. Environment variables are expanded.
+  resign:
+    type: boolean
+    default: true
+    description: >
+      Re-sign each package with the production key, replacing melange's
+      build-time signature.
+  allow_create:
+    type: boolean
+    default: false
+    description: >
+      Create the repository when the bucket has no index for an architecture
+      yet. Off by default, so a mistyped prefix fails instead of starting a
+      new repository.
+  max_attempts:
+    type: integer
+    default: 5
+    description: >
+      How many times to merge and upload each architecture's index when
+      another publish changes it first, with backoff between attempts.
+  publish_public_key:
+    type: boolean
+    default: false
+    description: >
+      Also upload <prefix>/<key_name>.pub, a convenience copy of the public
+      key. It is never a trust anchor: verify with the keyring from your
+      checkout.
+  s3_checksums:
+    type: boolean
+    default: true
+    description: >
+      Send each upload's SHA-256 for S3 to check (--checksum-sha256). Turn it
+      off for S3-compatible services that reject checksum headers.
+  dry_run:
+    type: boolean
+    default: false
+    description: >
+      Do everything but write: read and verify the bucket's index, prepare
+      the packages and the merged index, and report what would be uploaded.
+  receipt_path:
+    type: string
+    default: apk-repo-receipt.json
+    description: >
+      Where to write the JSON receipt of what was published. Its absolute
+      path is exported as APK_REPO_RECEIPT. Environment variables are
+      expanded.
+steps:
+  - run:
+      name: Publish APK packages
+      environment:
+        PARAM_ALLOW_CREATE: << parameters.allow_create >>
+        PARAM_ARCH: << parameters.arch >>
+        PARAM_BACKEND: << parameters.backend >>
+        PARAM_BUCKET: << parameters.bucket >>
+        PARAM_DRY_RUN: << parameters.dry_run >>
+        PARAM_ENDPOINT_URL: << parameters.endpoint_url >>
+        PARAM_KEY_NAME: << parameters.key_name >>
+        PARAM_KEYRING: << parameters.keyring >>
+        PARAM_MAX_ATTEMPTS: << parameters.max_attempts >>
+        PARAM_PACKAGES_DIR: << parameters.packages_dir >>
+        PARAM_PREFIX: << parameters.prefix >>
+        PARAM_PUBLISH_PUBLIC_KEY: << parameters.publish_public_key >>
+        PARAM_RECEIPT_PATH: << parameters.receipt_path >>
+        PARAM_REGION: << parameters.region >>
+        PARAM_RESIGN: << parameters.resign >>
+        PARAM_S3_CHECKSUMS: << parameters.s3_checksums >>
+        PARAM_SIGNING_KEY: << parameters.signing_key >>
+        SCRIPT_APK_REPO_LIB: << include(scripts/lib/apk_repo.sh) >>
+        SCRIPT_APK_REPO_PY: << include(scripts/apk_repo.py) >>
+      command: << include(scripts/publish.sh) >>

@@ -1,0 +1,46 @@
+description: >
+  Verifies a local APK repository offline, against your keyring: no network
+  and no AWS CLI. For each architecture, dir/<arch>/APKINDEX.tar.gz must be
+  signed by a keyring key, and every package it lists must be in the
+  directory with a SHA-256 sidecar signed by a keyring key, matching the
+  package's bytes and the index's size and checksum. Files the index doesn't
+  list are reported with a warning. Writes a JSON receipt of what it
+  verified. Needs python3 (3.8 or newer) and the openssl CLI.
+parameters:
+  dir:
+    type: string
+    default: packages
+    description: >
+      The repository directory, holding <arch>/APKINDEX.tar.gz and the
+      packages, such as pull's out_dir. Environment variables are expanded.
+  arch:
+    type: string
+    default: ""
+    description: >
+      Architectures to verify, space-separated: x86_64 and/or aarch64.
+      Empty (the default) is the machine's own. Environment variables are
+      expanded.
+  keyring:
+    type: string
+    description: >
+      Public keys to trust, space-separated: files named <key>.rsa.pub, or
+      directories whose *.rsa.pub files are all trusted, from your
+      checkout. A key is never taken from the repository itself.
+      Environment variables are expanded.
+  receipt_path:
+    type: string
+    default: apk-repo-receipt.json
+    description: >
+      Where to write the JSON receipt of what was verified. Its absolute path
+      is exported as APK_REPO_RECEIPT. Environment variables are expanded.
+steps:
+  - run:
+      name: Verify APK repository
+      environment:
+        PARAM_ARCH: << parameters.arch >>
+        PARAM_DIR: << parameters.dir >>
+        PARAM_KEYRING: << parameters.keyring >>
+        PARAM_RECEIPT_PATH: << parameters.receipt_path >>
+        SCRIPT_APK_REPO_LIB: << include(scripts/lib/apk_repo.sh) >>
+        SCRIPT_APK_REPO_PY: << include(scripts/apk_repo.py) >>
+      command: << include(scripts/verify.sh) >>

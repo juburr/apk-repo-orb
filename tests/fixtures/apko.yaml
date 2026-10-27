@@ -1,0 +1,18 @@
+# The end-to-end test's image (T-6): the package pull fetched from the bucket
+# into ./pulled, trusted through the key it was published with. Relative
+# paths are resolved against the directory apko runs in.
+contents:
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    - ./keyring/apk-repo-test.rsa.pub
+  repositories:
+    - https://packages.wolfi.dev/os
+    # Only packages pinned with @local come from this repository.
+    - '@local ./pulled'
+  packages:
+    - wolfi-baselayout
+    - busybox
+    - apk-repo-hello@local
+
+entrypoint:
+  command: /usr/bin/apk-repo-hello

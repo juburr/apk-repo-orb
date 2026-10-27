@@ -1,0 +1,49 @@
+description: >
+  Build packages with melange, then publish them to a signed APK repository
+  in an S3 bucket, re-signed with your production key. The job signs in to
+  AWS with CircleCI's OIDC token, so no AWS keys are stored: AWS_ROLE_ARN
+  (a role whose trust policy accepts this project's token; see Bucket Setup
+  in the README) and AWS_REGION come from the context, with
+  APK_SIGNING_KEY, the PEM private key of my-org-apk.rsa. OIDC tokens are
+  only issued to jobs that use a context. keys/my-org-apk.rsa.pub, committed
+  to the repository, is the keyring. The first publish to a new prefix
+  needs allow_create. Publishes running at the same time never lose each
+  other's packages.
+
+usage:
+  version: 2.1
+  orbs:
+    apk-repo: juburr/apk-repo-orb@0.1.0
+    melange: juburr/melange-orb@1.2.0
+  jobs:
+    publish-packages:
+      machine:
+        image: ubuntu-2404:current
+      resource_class: arm.medium # or medium for x86_64
+      steps:
+        - checkout
+        - melange/install
+        - run:
+            name: Build the packages
+            command: |
+              melange keygen build.rsa
+              melange build melange.yaml --runner docker --arch "$(uname -m)" \
+                --signing-key build.rsa --out-dir packages
+        - run:
+            name: Use the job's OIDC token for AWS
+            command: |
+              printf '%s' "${CIRCLE_OIDC_TOKEN_V2}" > /tmp/aws-web-identity-token
+              printf 'export AWS_WEB_IDENTITY_TOKEN_FILE=%q\n' /tmp/aws-web-identity-token >> "${BASH_ENV}"
+        - apk-repo/publish:
+            bucket: my-org-apk
+            prefix: my-org/os
+            keyring: keys
+            key_name: my-org-apk.rsa
+  workflows:
+    publish:
+      jobs:
+        - publish-packages:
+            context: apk-publishing
+            filters:
+              branches:
+                only: main

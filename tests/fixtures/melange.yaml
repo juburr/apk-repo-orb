@@ -1,0 +1,24 @@
+# The package the tests that run real melange build: the golden test (T-3)
+# and the end-to-end test (T-6), whose image runs the script it installs.
+package:
+  name: apk-repo-hello
+  version: 0.0.1
+  epoch: 0
+  description: Test package for apk-repo-orb
+  copyright:
+    - license: MIT
+
+environment:
+  contents:
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    repositories:
+      - https://packages.wolfi.dev/os
+    packages:
+      - busybox
+
+pipeline:
+  - runs: |
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      printf '#!/bin/sh\necho "hello from apk-repo-orb"\n' > "${{targets.destdir}}/usr/bin/apk-repo-hello"
+      chmod 0755 "${{targets.destdir}}/usr/bin/apk-repo-hello"

@@ -1,0 +1,10 @@
+version: 2.1
+
+description: >
+  Publishes and pulls signed APK repositories kept in an S3 bucket, so the packages melange builds can be signed
+  once with a durable key, shared between pipelines, and installed by apko. Every byte is verified against your
+  keyring, published packages are immutable, and concurrent publishers can't lose each other's packages.
+
+display:
+  home_url: "https://github.com/juburr/apk-repo-orb"
+  source_url: "https://github.com/juburr/apk-repo-orb"
