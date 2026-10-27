@@ -27,6 +27,8 @@ AR_CONFLICT=6
 # The oldest AWS CLI v2 whose s3api put-object takes --if-match; 2.17.34
 # added --if-none-match.
 AR_AWS_MIN_VERSION="2.22.5"
+# How many downloads ar_get_objects runs at once.
+AR_PARALLEL=8
 # Signatures ar_verify_sidecar has warned about, so each is reported once.
 declare -A AR_SIG_WARNED=()
 
@@ -480,23 +482,72 @@ ar_denied_hint() {
 # ar_get_object KEY OUT: downloads KEY to OUT. Returns 0 (setting AR_ETAG
 # and AR_VERSION_ID), AR_ABSENT or AR_DENIED; any other error is fatal.
 ar_get_object() {
-    local key=$1 out=$2 status result
+    local key=$1 out=$2 status result err kind
+    # Its own error file, since ar_get_objects runs several at once.
+    err=$(mktemp "${AR_WORK}/aws.XXXXXX")
     status=0
     result=$(aws s3api get-object ${AR_AWS_OPTIONS[@]+"${AR_AWS_OPTIONS[@]}"} --bucket "${AR_BUCKET}" --key "${key}" \
-        --query '[ETag, VersionId]' --output text "${out}" 2> "${AR_WORK}/aws.err") || status=$?
+        --query '[ETag, VersionId]' --output text "${out}" 2> "${err}") || status=$?
     if [[ "${status}" -eq 0 ]]; then
+        rm -f -- "${err}"
         AR_ETAG=${result%%$'\t'*}
         AR_VERSION_ID=${result#*$'\t'}
         [[ "${AR_VERSION_ID}" == "None" || "${AR_VERSION_ID}" == "null" ]] && AR_VERSION_ID=""
         return 0
     fi
     rm -f -- "${out}"
-    case "$(ar_aws_status "${AR_WORK}/aws.err")" in
-        absent) return "${AR_ABSENT}" ;;
-        denied) return "${AR_DENIED}" ;;
+    kind=$(ar_aws_status "${err}")
+    case "${kind}" in
+        absent) rm -f -- "${err}"; return "${AR_ABSENT}" ;;
+        denied) rm -f -- "${err}"; return "${AR_DENIED}" ;;
     esac
-    cat "${AR_WORK}/aws.err" >&2
+    cat "${err}" >&2
     ar_die "Couldn't read $(ar_s3_url "${key}"): the AWS CLI's GetObject exited ${status}, with the message above."
+}
+
+# ar_get_objects LIST: downloads every "KEY<TAB>OUT<TAB>STATUS" line of LIST,
+# AR_PARALLEL at a time, and writes each ar_get_object status (0, AR_ABSENT
+# or AR_DENIED) to its STATUS file. A STATUS file left empty means another
+# failure, whose error is printed already. Check them with
+# ar_require_fetched and ar_optional_fetched. Batches rather than wait -n,
+# which bash before 4.3 lacks.
+ar_get_objects() {
+    local key out status_file count=0
+    while IFS=$'\t' read -r key out status_file; do
+        : > "${status_file}"
+        (
+            status=0
+            ar_get_object "${key}" "${out}" || status=$?
+            printf '%s\n' "${status}" > "${status_file}"
+        ) &
+        count=$((count + 1))
+        if (( count % AR_PARALLEL == 0 )); then
+            wait
+        fi
+    done < "$1"
+    wait
+}
+
+# ar_require_fetched STATUS KEY WHAT: KEY, which the index requires for WHAT,
+# was downloaded; anything else is fatal.
+ar_require_fetched() {
+    case "$(cat -- "$1")" in
+        0) ;;
+        "${AR_ABSENT}") ar_die "$(ar_s3_url "$2") is missing, though the index lists $3." \
+            "The repository is incomplete; publish the package again." ;;
+        "${AR_DENIED}") ar_die "Access to $(ar_s3_url "$2") was denied." "$(ar_denied_hint "$2")" ;;
+        *) ar_die "Couldn't read $(ar_s3_url "$2"); the error is above." ;;
+    esac
+}
+
+# ar_optional_fetched STATUS KEY: KEY, a signature that may not exist, was
+# downloaded or is absent; denied or another failure is fatal.
+ar_optional_fetched() {
+    case "$(cat -- "$1")" in
+        0 | "${AR_ABSENT}") ;;
+        "${AR_DENIED}") ar_die "Access to $(ar_s3_url "$2") was denied." "$(ar_denied_hint "$2")" ;;
+        *) ar_die "Couldn't read $(ar_s3_url "$2"); the error is above." ;;
+    esac
 }
 
 # ar_put_object KEY FILE CONTENT_TYPE CACHE_CONTROL CONDITION: uploads FILE
@@ -506,7 +557,7 @@ ar_get_object() {
 # AR_ETAG and AR_VERSION_ID), AR_PRECONDITION, AR_CONFLICT, AR_ABSENT
 # (If-Match on a missing key) or AR_DENIED; any other error is fatal.
 ar_put_object() {
-    local key=$1 file=$2 status result
+    local key=$1 file=$2 status result err kind
     local -a options checksum=()
     if [[ "${AR_S3_CHECKSUMS:-true}" == "true" ]]; then
         checksum=(--checksum-sha256 "$(openssl dgst -sha256 -binary "${file}" | base64)")
@@ -517,24 +568,27 @@ ar_put_object() {
     options=(${AR_AWS_OPTIONS[@]+"${AR_AWS_OPTIONS[@]}"} --bucket "${AR_BUCKET}" --key "${key}" --body "${file}"
         --content-type "$3" --cache-control "$4" ${checksum[@]+"${checksum[@]}"} --query '[ETag, VersionId]' --output text)
     status=0
+    err=$(mktemp "${AR_WORK}/aws.XXXXXX")
     if [[ "$5" == "*" ]]; then
-        result=$(aws s3api put-object "${options[@]}" --if-none-match "*" 2> "${AR_WORK}/aws.err") || status=$?
+        result=$(aws s3api put-object "${options[@]}" --if-none-match "*" 2> "${err}") || status=$?
     else
-        result=$(aws s3api put-object "${options[@]}" --if-match "$5" 2> "${AR_WORK}/aws.err") || status=$?
+        result=$(aws s3api put-object "${options[@]}" --if-match "$5" 2> "${err}") || status=$?
     fi
     if [[ "${status}" -eq 0 ]]; then
+        rm -f -- "${err}"
         AR_ETAG=${result%%$'\t'*}
         AR_VERSION_ID=${result#*$'\t'}
         [[ "${AR_VERSION_ID}" == "None" || "${AR_VERSION_ID}" == "null" ]] && AR_VERSION_ID=""
         return 0
     fi
-    case "$(ar_aws_status "${AR_WORK}/aws.err")" in
-        precondition) return "${AR_PRECONDITION}" ;;
-        conflict) return "${AR_CONFLICT}" ;;
-        absent) return "${AR_ABSENT}" ;;
-        denied) return "${AR_DENIED}" ;;
+    kind=$(ar_aws_status "${err}")
+    case "${kind}" in
+        precondition) rm -f -- "${err}"; return "${AR_PRECONDITION}" ;;
+        conflict) rm -f -- "${err}"; return "${AR_CONFLICT}" ;;
+        absent) rm -f -- "${err}"; return "${AR_ABSENT}" ;;
+        denied) rm -f -- "${err}"; return "${AR_DENIED}" ;;
     esac
-    cat "${AR_WORK}/aws.err" >&2
+    cat "${err}" >&2
     ar_die "Couldn't write $(ar_s3_url "${key}"): the AWS CLI's PutObject exited ${status}, with the message above."
 }
 

@@ -450,14 +450,31 @@ sidecar_ok() {
 # its sidecar, verified (S-4), for the receipt. Fetched before the index is
 # written, so nothing after that can fail, and kept across attempts.
 receipt_shas() {
-    local arch=$1 name version file
+    local arch=$1 name version file signer dir="${AR_WORK}/receipt-sidecars/$1" list
+    local -a missing=()
+    mkdir -p "${dir}"
+    list=$(mktemp "${AR_WORK}/fetch.XXXXXX")
     while IFS=$'\t' read -r name version _; do
         file="${name}-${version}.apk"
-        if [[ -z "${PKG_SHA[${arch}/${file}]:-}" ]]; then
-            remote_sidecar "${arch}" "${file}" "${AR_WORK}/receipt-sidecars/${arch}"
-            PKG_SHA[${arch}/${file}]=${AR_SIDECAR_SHA256}
-        fi
+        [[ -n "${PKG_SHA[${arch}/${file}]:-}" ]] && continue
+        missing+=("${file}")
+        printf '%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}.sha256" "${dir}/${file}.sha256" "${dir}/${file}.sha256.status" >> "${list}"
+        for signer in "${AR_KEY_NAMES[@]}"; do
+            printf '%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}.sha256.${signer}.sig" "${dir}/${file}.sha256.${signer}.sig" \
+                "${dir}/${file}.sha256.${signer}.sig.status" >> "${list}"
+        done
     done < "$2"
+    # Fetched in parallel (an index can list hundreds of packages), then
+    # verified one by one.
+    ar_get_objects "${list}"
+    for file in ${missing[@]+"${missing[@]}"}; do
+        ar_require_fetched "${dir}/${file}.sha256.status" "${PREFIX}/${arch}/${file}.sha256" "${file}"
+        for signer in "${AR_KEY_NAMES[@]}"; do
+            ar_optional_fetched "${dir}/${file}.sha256.${signer}.sig.status" "${PREFIX}/${arch}/${file}.sha256.${signer}.sig"
+        done
+        ar_verify_sidecar "${dir}" "${file}"
+        PKG_SHA[${arch}/${file}]=${AR_SIDECAR_SHA256}
+    done
 }
 
 # publish_arch ARCH: the compare-and-swap loop for one architecture (U-6 to

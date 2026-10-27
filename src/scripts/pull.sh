@@ -93,18 +93,6 @@ mkdir -p "${AR_WORK}/receipt"
 ar_receipt_meta tool_version "${AR_TOOL_VERSION}" operation pull dry_run false backend "${BACKEND}" \
     endpoint_url "${ENDPOINT_URL}" bucket "${BUCKET}" prefix "${PREFIX}" started "$(ar_now)"
 
-# fetch KEY OUT WHAT: downloads a file the index requires.
-fetch() {
-    local status=0
-    ar_get_object "$1" "$2" || status=$?
-    case "${status}" in
-        0) ;;
-        "${AR_ABSENT}") ar_die "$(ar_s3_url "$1") is missing, though the index lists $3." \
-            "The repository is incomplete; publish the package again." ;;
-        "${AR_DENIED}") ar_die "Access to $(ar_s3_url "$1") was denied." "$(ar_denied_hint "$1")" ;;
-    esac
-}
-
 for arch in "${AR_ARCHES[@]}"; do
     stage="${AR_WORK}/stage/${arch}"
     mkdir -p "${stage}"
@@ -124,19 +112,28 @@ for arch in "${AR_ARCHES[@]}"; do
 
     # Only what the verified index lists: each package's sidecar and its
     # signatures by keyring keys, then the package itself, from the cache
-    # when a cached copy matches the signed sidecar.
+    # when a cached copy matches the signed sidecar. Downloads run in
+    # parallel; everything is verified here, one by one.
+    fetched="${AR_WORK}/fetched/${arch}"
+    mkdir -p "${fetched}"
+    : > "${fetched}/sidecars"
+    : > "${fetched}/packages"
+    while IFS=$'\t' read -r name version _; do
+        file="${name}-${version}.apk"
+        printf '%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}.sha256" "${stage}/${file}.sha256" "${fetched}/${file}.sha256" >> "${fetched}/sidecars"
+        for signer in "${AR_KEY_NAMES[@]}"; do
+            printf '%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}.sha256.${signer}.sig" "${stage}/${file}.sha256.${signer}.sig" \
+                "${fetched}/${file}.sha256.${signer}.sig" >> "${fetched}/sidecars"
+        done
+    done < "${AR_WORK}/${arch}/entries.tsv"
+    ar_get_objects "${fetched}/sidecars"
     downloaded=0
     reused=0
     while IFS=$'\t' read -r name version _; do
         file="${name}-${version}.apk"
-        fetch "${PREFIX}/${arch}/${file}.sha256" "${stage}/${file}.sha256" "${name} ${version}"
+        ar_require_fetched "${fetched}/${file}.sha256" "${PREFIX}/${arch}/${file}.sha256" "${name} ${version}"
         for signer in "${AR_KEY_NAMES[@]}"; do
-            status=0
-            ar_get_object "${PREFIX}/${arch}/${file}.sha256.${signer}.sig" "${stage}/${file}.sha256.${signer}.sig" || status=$?
-            if [[ "${status}" -eq "${AR_DENIED}" ]]; then
-                ar_die "Access to $(ar_s3_url "${PREFIX}/${arch}/${file}.sha256.${signer}.sig") was denied." \
-                    "$(ar_denied_hint "${PREFIX}/${arch}/${file}")"
-            fi
+            ar_optional_fetched "${fetched}/${file}.sha256.${signer}.sig" "${PREFIX}/${arch}/${file}.sha256.${signer}.sig"
         done
         ar_verify_sidecar "${stage}" "${file}"
         cached="${CACHE_DIR:+${CACHE_DIR}/${arch}/${file}}"
@@ -144,10 +141,14 @@ for arch in "${AR_ARCHES[@]}"; do
             cp -- "${cached}" "${stage}/${file}"
             reused=$((reused + 1))
         else
-            fetch "${PREFIX}/${arch}/${file}" "${stage}/${file}" "${name} ${version}"
+            printf '%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}" "${stage}/${file}" "${fetched}/${file}" >> "${fetched}/packages"
             downloaded=$((downloaded + 1))
         fi
     done < "${AR_WORK}/${arch}/entries.tsv"
+    ar_get_objects "${fetched}/packages"
+    while IFS=$'\t' read -r object package status_file; do
+        ar_require_fetched "${status_file}" "${object}" "$(basename -- "${package}")"
+    done < "${fetched}/packages"
 
     ar_verify_packages "${stage}" "${arch}" "${AR_WORK}/${arch}" "${AR_WORK}/receipt/arch/${arch}"
     printf '%s\t%s\n' key "${key}" sha256 "$(ar_sha256 "${stage}/APKINDEX.tar.gz")" etag "${etag}" \
