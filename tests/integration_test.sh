@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Integration tests against an S3-compatible server that enforces
-# conditional writes (T-4), with the real AWS CLI and melange, and the race
+# conditional writes (T-4), or Amazon S3 itself (T-7), with the real AWS CLI
+# and melange, and the race
 # test (T-5): two publishes of different packages at once, RACE_ROUNDS
 # times, each ending with both packages in the index and a pull and verify
 # that pass. tests/s3_server.sh starts the server and proves its 412s
@@ -11,9 +12,12 @@
 #
 # Environment:
 #   APK_REPO_BUCKET    the bucket (required); each scenario uses its own prefix
-#   APK_REPO_ENDPOINT  the server (default http://localhost:7070)
+#   APK_REPO_ENDPOINT  the server (default http://localhost:7070); set it
+#                      empty for Amazon S3
+#   APK_REPO_PREFIX    a prefix every scenario's prefix goes under (default
+#                      none), so runs sharing a bucket never meet
 #   RACE_ROUNDS        rounds of the race test (default 20)
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION or AWS_REGION
 #
 # Needs the AWS CLI v2 (2.22.5 or newer), melange, python3 and openssl. Run
 # from a checkout:
@@ -25,7 +29,14 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "${WORK}"' EXIT
 BUCKET=${APK_REPO_BUCKET:?ERROR: set APK_REPO_BUCKET}
-ENDPOINT=${APK_REPO_ENDPOINT:-http://localhost:7070}
+ENDPOINT=${APK_REPO_ENDPOINT-http://localhost:7070}
+ROOT_PREFIX=${APK_REPO_PREFIX:-}
+ROOT_PREFIX=${ROOT_PREFIX%/}
+# The test's own AWS CLI calls go where the orb's do.
+ENDPOINT_ARGS=()
+if [[ -n "${ENDPOINT}" ]]; then
+    ENDPOINT_ARGS=(--endpoint-url "${ENDPOINT}")
+fi
 ROUNDS=${RACE_ROUNDS:-20}
 FIXTURES="python3 -I ${ROOT}/tests/apk_fixtures.py"
 RUN="${ROOT}/tests/run_command.sh"
@@ -62,7 +73,7 @@ receipt_is() {
 
 # s3_etag KEY: the object's ETag, or "absent".
 s3_etag() {
-    aws s3api get-object --endpoint-url "${ENDPOINT}" --bucket "${BUCKET}" --key "$1" \
+    aws s3api get-object ${ENDPOINT_ARGS[@]+"${ENDPOINT_ARGS[@]}"} --bucket "${BUCKET}" --key "$1" \
         --query ETag --output text "${WORK}/object" 2> /dev/null || echo absent
 }
 
@@ -74,12 +85,13 @@ cp "${WORK}/keys/test-apk.rsa.pub" "${WORK}/keyring/"
 SIGNING_KEY_PEM=$(cat "${WORK}/keys/test-apk.rsa")
 melange version 2>&1 | grep -i 'gitversion' || true
 aws --version
+echo "Testing s3://${BUCKET}/${ROOT_PREFIX:+${ROOT_PREFIX}/} at ${ENDPOINT:-Amazon S3}."
 
 CASES=0
 new_case() {
     CASES=$((CASES + 1))
     CASE="${WORK}/case-${CASES}"
-    PREFIX="it/${CASES}-$1"
+    PREFIX="${ROOT_PREFIX:+${ROOT_PREFIX}/}it/${CASES}-$1"
     mkdir -p "${CASE}"
 }
 
@@ -119,6 +131,7 @@ package aarch64 hello 1.0-r0
 run publish allow_create=true
 check "creating the repository succeeds for both architectures" succeeded
 check "F-13: after the probe found conditional writes enforced" said "enforces conditional writes"
+echo "  The index's version_id is $(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["architectures"]["x86_64"]["index"]["version_id"])' "${CASE}/receipt.json") (set only in a versioned bucket)."
 check "publishing each package once" receipt_is '[r["architectures"][a]["published"] for a in ("aarch64", "x86_64")], r["architectures"]["x86_64"]["attempts"]' "([['hello-1.0-r0.apk'], ['hello-1.0-r0.apk']], 1)"
 check "the probe object holds the fixed bytes" [ "$(s3_etag "${PREFIX}/.apk-repo-orb/probe")" != absent ]
 package x86_64 world 2.0-r0 more
@@ -143,7 +156,7 @@ check "uploading nothing" [ "$(s3_etag "${PREFIX}/x86_64/dry-3.0-r0.apk")" == ab
 check "and leaving the index as it was" [ "$(s3_etag "${PREFIX}/x86_64/APKINDEX.tar.gz")" == "${before}" ]
 run publish publish_public_key=true
 check "U-16: publish_public_key uploads the public key" succeeded
-aws s3api get-object --endpoint-url "${ENDPOINT}" --bucket "${BUCKET}" --key "${PREFIX}/test-apk.rsa.pub" "${WORK}/public.pub" > /dev/null 2>&1
+aws s3api get-object ${ENDPOINT_ARGS[@]+"${ENDPOINT_ARGS[@]}"} --bucket "${BUCKET}" --key "${PREFIX}/test-apk.rsa.pub" "${WORK}/public.pub" > /dev/null 2>&1
 check "byte for byte" cmp -s "${WORK}/public.pub" "${WORK}/keys/test-apk.rsa.pub"
 
 begin "T-4: pull and verify"
@@ -156,13 +169,18 @@ run pull arch=x86_64 out_dir=first cache_dir=cache
 run pull arch=x86_64 out_dir=second cache_dir=cache
 check "P-6: a second pull takes the packages from cache_dir" said "0 package(s) downloaded, 2 from the cache"
 
-begin "U-8: allow_create"
+begin "U-8, P-4: a prefix with no repository"
 new_case missing
 package x86_64 hello 1.0-r0
 run publish
 check "publishing to a prefix with no repository fails without allow_create" failed
 check "saying so" said "set allow_create to create it"
 check "creating no index" [ "$(s3_etag "${PREFIX}/x86_64/APKINDEX.tar.gz")" == absent ]
+run pull arch=x86_64 out_dir=pulled
+check "pulling from it fails" failed
+check "P-4, E-3: saying there is no repository there (a 404, not a 403)" said "There is no repository at"
+run publish allow_create=true s3_checksums=false
+check "s3_checksums=false: publishing without SHA-256 checksum headers succeeds" succeeded
 
 begin "U-2: the signing key"
 new_case wrong-key
@@ -180,13 +198,19 @@ etag=$(s3_etag "${key}")
 cp "${WORK}/object" "${WORK}/tampered.apk"
 printf 'x' >> "${WORK}/tampered.apk"
 # The test replaces the object the way only a writer with the current ETag
-# can; the orb never would.
-aws s3api put-object --endpoint-url "${ENDPOINT}" --bucket "${BUCKET}" --key "${key}" \
-    --body "${WORK}/tampered.apk" --if-match "${etag}" > /dev/null
-run pull arch=x86_64 out_dir=pulled
-check "pull refuses it" failed
-check "on its signed sidecar" said "its signed sidecar names"
-check "leaving out_dir empty" [ ! -e "${CASE}/pulled/x86_64" ]
+# can; the orb never would. A bucket with the README's bucket policy refuses
+# that write, which leaves no tampered package to pull.
+if aws s3api put-object ${ENDPOINT_ARGS[@]+"${ENDPOINT_ARGS[@]}"} --bucket "${BUCKET}" --key "${key}" \
+    --body "${WORK}/tampered.apk" --if-match "${etag}" > /dev/null 2> "${WORK}/tamper.err"; then
+    run pull arch=x86_64 out_dir=pulled
+    check "pull refuses it" failed
+    check "on its signed sidecar" said "its signed sidecar names"
+    check "leaving out_dir empty" [ ! -e "${CASE}/pulled/x86_64" ]
+else
+    OUTPUT=$(cat "${WORK}/tamper.err")
+    check "the bucket refuses to replace the package with AccessDenied (a bucket policy)" said "AccessDenied"
+    check "and the package is unchanged" [ "$(s3_etag "${key}")" == "${etag}" ]
+fi
 
 begin "T-5: concurrent publishes (${ROUNDS} rounds)"
 new_case race

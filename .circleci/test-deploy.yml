@@ -50,6 +50,59 @@ commands:
             openssl version
             aws --version
             melange version 2>&1 | grep -i gitversion || true
+  # The keys and the package the pipelines publish: a build key for melange, and the
+  # repository's key, whose public half goes in the keyring and private half in APK_SIGNING_KEY.
+  make-test-package:
+    steps:
+      - run:
+          name: Make the keys and build the package
+          command: |
+            melange keygen build.rsa
+            melange keygen apk-repo-test.rsa
+            mkdir -p keyring
+            mv apk-repo-test.rsa.pub keyring/
+            printf 'export %s=%q\n' APK_SIGNING_KEY "$(cat apk-repo-test.rsa)" >> "${BASH_ENV}"
+            rm apk-repo-test.rsa
+            melange build tests/fixtures/melange.yaml --runner docker --arch "$(uname -m)" \
+              --signing-key build.rsa --out-dir packages
+  check-publish-receipt:
+    steps:
+      - run:
+          name: Check the publish receipt
+          command: |
+            python3 -I - "${APK_REPO_RECEIPT}" "$(uname -m)" \<< 'EOF'
+            import json, sys
+            receipt, arch = json.load(open(sys.argv[1])), sys.argv[2]
+            published = receipt["architectures"][arch]["published"]
+            assert published == ["apk-repo-hello-0.0.1-r0.apk"], published
+            index = receipt["architectures"][arch]["index"]
+            assert index["signature"] == ".SIGN.RSA256.apk-repo-test.rsa.pub"
+            print("Published", published, "to", receipt["bucket"], "at", receipt["prefix"])
+            print("The index's version_id is", index["version_id"])
+            EOF
+  # apko builds an image from the pulled repository, which must run the package's script.
+  run-test-image:
+    steps:
+      - apko-orb/build:
+          config: tests/fixtures/apko.yaml
+          image: apk-repo-e2e:latest
+          arch: host
+          log_level: info
+          output_path: image/e2e.tar
+      - run:
+          name: Run the image
+          command: |
+            case "$(uname -m)" in
+              x86_64) tag=amd64 ;;
+              aarch64) tag=arm64 ;;
+            esac
+            docker load --input image/e2e.tar
+            OUTPUT=$(docker run --rm "apk-repo-e2e:latest-${tag}")
+            echo "${OUTPUT}"
+            if [[ "${OUTPUT}" != "hello from apk-repo-orb" ]]; then
+              echo "The image didn't run the pulled package's script."
+              exit 1
+            fi
 
 jobs:
   # T-3: verify accepts what real melange writes (melange build, sign and index, and an index
@@ -106,17 +159,7 @@ jobs:
       - run:
           name: Start the S3 server
           command: bash tests/s3_server.sh apk-repo-e2e
-      - run:
-          name: Make the keys and build the package
-          command: |
-            melange keygen build.rsa
-            melange keygen apk-repo-test.rsa
-            mkdir -p keyring
-            mv apk-repo-test.rsa.pub keyring/
-            printf 'export %s=%q\n' APK_SIGNING_KEY "$(cat apk-repo-test.rsa)" >> "${BASH_ENV}"
-            rm apk-repo-test.rsa
-            melange build tests/fixtures/melange.yaml --runner docker --arch "$(uname -m)" \
-              --signing-key build.rsa --out-dir packages
+      - make-test-package
       - apk-repo-orb/publish:
           bucket: apk-repo-e2e
           prefix: e2e/os
@@ -124,17 +167,7 @@ jobs:
           keyring: keyring
           key_name: apk-repo-test.rsa
           allow_create: true
-      - run:
-          name: Check the publish receipt
-          command: |
-            python3 -I - "${APK_REPO_RECEIPT}" "$(uname -m)" \<< 'EOF'
-            import json, sys
-            receipt, arch = json.load(open(sys.argv[1])), sys.argv[2]
-            published = receipt["architectures"][arch]["published"]
-            assert published == ["apk-repo-hello-0.0.1-r0.apk"], published
-            assert receipt["architectures"][arch]["index"]["signature"] == ".SIGN.RSA256.apk-repo-test.rsa.pub"
-            print("Published", published)
-            EOF
+      - check-publish-receipt
       - apk-repo-orb/pull:
           bucket: apk-repo-e2e
           prefix: e2e/os
@@ -144,26 +177,57 @@ jobs:
       - apk-repo-orb/verify:
           dir: pulled
           keyring: keyring
-      - apko-orb/build:
-          config: tests/fixtures/apko.yaml
-          image: apk-repo-e2e:latest
-          arch: host
-          log_level: info
-          output_path: image/e2e.tar
+      - run-test-image
+  # T-7: the integration tests (10 race rounds) and the end-to-end pipeline against Amazon S3
+  # itself, with the IAM user and bucket in the s3_apk_test_rw context (AWS_ACCESS_KEY_ID,
+  # AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_S3_BUCKET_NAME). Each run writes under its own
+  # prefix in apk-repo-orb-ci/, which a lifecycle rule on the bucket expires, since the orb
+  # never deletes. Without AWS_S3_BUCKET_NAME the job stops at its first step and passes.
+  aws-s3-test:
+    executor: machine-amd64
+    steps:
       - run:
-          name: Run the image
+          name: Skip without a bucket
           command: |
-            case "$(uname -m)" in
-              x86_64) tag=amd64 ;;
-              aarch64) tag=arm64 ;;
-            esac
-            docker load --input image/e2e.tar
-            OUTPUT=$(docker run --rm "apk-repo-e2e:latest-${tag}")
-            echo "${OUTPUT}"
-            if [[ "${OUTPUT}" != "hello from apk-repo-orb" ]]; then
-              echo "The image didn't run the pulled package's script."
-              exit 1
+            if [[ -z "${AWS_S3_BUCKET_NAME:-}" ]]; then
+              echo "AWS_S3_BUCKET_NAME isn't set (it comes from the s3_apk_test_rw context): skipping the Amazon S3 tests."
+              circleci-agent step halt
             fi
+      - checkout
+      - melange-orb/install
+      - apko-orb/install
+      - show-tools
+      - run:
+          name: Choose this run's prefix
+          command: |
+            prefix="apk-repo-orb-ci/${CIRCLE_WORKFLOW_ID}-${CIRCLE_BUILD_NUM}"
+            printf 'export %s=%q\n' APK_REPO_TEST_PREFIX "${prefix}" >> "${BASH_ENV}"
+            echo "This run writes under s3://${AWS_S3_BUCKET_NAME}/${prefix}/ in ${AWS_REGION:-the default region of the AWS CLI}."
+      - run:
+          name: Run the integration tests against Amazon S3
+          command: |
+            APK_REPO_BUCKET="${AWS_S3_BUCKET_NAME}" APK_REPO_ENDPOINT='' APK_REPO_PREFIX="${APK_REPO_TEST_PREFIX}" \
+              bash tests/integration_test.sh
+          environment:
+            RACE_ROUNDS: "10"
+      - make-test-package
+      # The orb's commands expand the variables in their parameters.
+      - apk-repo-orb/publish:
+          bucket: ${AWS_S3_BUCKET_NAME}
+          prefix: ${APK_REPO_TEST_PREFIX}/e2e/os
+          keyring: keyring
+          key_name: apk-repo-test.rsa
+          allow_create: true
+      - check-publish-receipt
+      - apk-repo-orb/pull:
+          bucket: ${AWS_S3_BUCKET_NAME}
+          prefix: ${APK_REPO_TEST_PREFIX}/e2e/os
+          keyring: keyring
+          out_dir: pulled
+      - apk-repo-orb/verify:
+          dir: pulled
+          keyring: keyring
+      - run-test-image
 
 workflows:
   test-deploy:
@@ -184,6 +248,9 @@ workflows:
             parameters:
               executor: [machine-amd64, machine-arm64]
           filters: *filters
+      - aws-s3-test:
+          context: s3_apk_test_rw
+          filters: *filters
       # The orb must be re-packed for publishing, and saved to the workspace.
       - orb-tools/pack:
           filters: *release-filters
@@ -197,5 +264,6 @@ workflows:
             - golden-test
             - integration-test
             - end-to-end-test
+            - aws-s3-test
           context: orb-publishing
           filters: *release-filters
