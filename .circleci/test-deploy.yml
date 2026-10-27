@@ -202,11 +202,11 @@ jobs:
           command: |
             prefix="apk-repo-orb-ci/${CIRCLE_WORKFLOW_ID}-${CIRCLE_BUILD_NUM}"
             printf 'export %s=%q\n' APK_REPO_TEST_PREFIX "${prefix}" >> "${BASH_ENV}"
-            echo "This run writes under s3://${AWS_S3_BUCKET_NAME}/${prefix}/ in ${AWS_REGION:-the AWS CLI's region}."
+            echo "This run writes under s3://${AWS_S3_BUCKET_NAME}/${prefix}/ in ${AWS_REGION:-the default region of the AWS CLI}."
       - run:
           name: Run the integration tests against Amazon S3
           command: |
-            APK_REPO_BUCKET="${AWS_S3_BUCKET_NAME}" APK_REPO_ENDPOINT= APK_REPO_PREFIX="${APK_REPO_TEST_PREFIX}" \
+            APK_REPO_BUCKET="${AWS_S3_BUCKET_NAME}" APK_REPO_ENDPOINT='' APK_REPO_PREFIX="${APK_REPO_TEST_PREFIX}" \
               bash tests/integration_test.sh
           environment:
             RACE_ROUNDS: "10"
