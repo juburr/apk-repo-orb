@@ -546,7 +546,7 @@ The orb is a CI-side client; nothing serves the bucket. Should you want apko to 
 
 ### S3-compatible services
 
-Set `endpoint_url`. When it is empty and the AWS CLI would take an endpoint from `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL`, the orb uses that one instead, checks it the same way (`https://`, or `http://` to localhost), and names it in the receipt; an `endpoint_url` in an AWS CLI profile isn't seen. CI tests against [versitygw](https://github.com/versity/versitygw) v1.10.0, which enforces both conditions atomically, and the orb is built on Amazon S3's documented behavior; no test runs against Amazon S3 itself yet. Other services may work if `publish`'s probe passes, and it refuses those that ignore conditional writes. Services known to ignore them on `PutObject` include Garage, Zenko CloudServer and `rclone serve s3`.
+Set `endpoint_url`. When it is empty and the AWS CLI would take an endpoint from `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL`, the orb uses that one instead, checks it the same way (`https://`, or `http://` to localhost), and names it in the receipt; an `endpoint_url` in an AWS CLI profile isn't seen. CI tests against [versitygw](https://github.com/versity/versitygw) v1.10.0, which enforces both conditions atomically, and against Amazon S3 itself. Other services may work if `publish`'s probe passes, and it refuses those that ignore conditional writes. Services known to ignore them on `PutObject` include Garage, Zenko CloudServer and `rclone serve s3`.
 
 The AWS CLI computes a CRC checksum for every upload by default, and `publish` also sends each upload's SHA-256 (`s3_checksums`). For a service that rejects checksum headers, set `s3_checksums: false` and these AWS CLI settings in the job's environment:
 
@@ -613,8 +613,14 @@ This is an unofficial, community-maintained orb, and contributions are welcome! 
 - **Found a bug or have an idea?** [Open an issue](https://github.com/juburr/apk-repo-orb/issues).
 - **Before opening a pull request**, run `yamllint .`, `shellcheck src/scripts/*.sh src/scripts/lib/*.sh actions/*.sh tests/*.sh`, and every offline test: `bash tests/commands_test.sh`, `bash tests/wiring_test.sh`, `bash tests/actions_test.sh`, `bash tests/env_subst_test.sh` and `bash tests/shell_conventions_test.sh`. They need only bash, python3 and openssl: stand-ins replace the AWS CLI (a bucket in a local directory that can answer 403, 404, 409 and 412 or ignore conditions) and melange.
 - **With Docker, melange and the AWS CLI,** run what CI runs against a real server: `bash tests/s3_server.sh apk-repo-test`, then `APK_REPO_BUCKET=apk-repo-test bash tests/integration_test.sh`, and `bash tests/golden_test.sh` for melange's own output. `tests/s3_server.sh` needs `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` set to any test values.
+- **Against Amazon S3,** with credentials the [`publish` policy](#iam-policy-for-publish) allows: `APK_REPO_BUCKET=my-bucket APK_REPO_ENDPOINT= APK_REPO_PREFIX=apk-repo-orb-ci/my-run bash tests/integration_test.sh`. An empty `APK_REPO_ENDPOINT` means Amazon S3, and every scenario writes under `APK_REPO_PREFIX`. The objects stay behind, since nothing here deletes.
 
-CI lints and packs the orb and runs ShellCheck and the offline tests. Then it runs the golden tests with real melange, the integration and race tests against versitygw, and an end-to-end build on amd64 and arm64: melange builds a package, `publish` uploads it, `pull` fetches it, `verify` checks it, and apko builds an image from it that must run. A GitHub workflow ([`.github/workflows/actions.yml`](.github/workflows/actions.yml)) runs the same with the GitHub Actions on GitHub's runners.
+CI lints and packs the orb and runs ShellCheck and the offline tests. Then it runs the golden tests with real melange, the integration and race tests against versitygw, and an end-to-end build on amd64 and arm64: melange builds a package, `publish` uploads it, `pull` fetches it, `verify` checks it, and apko builds an image from it that must run. One more job runs the integration tests and that build against Amazon S3. A GitHub workflow ([`.github/workflows/actions.yml`](.github/workflows/actions.yml)) runs the same with the GitHub Actions on GitHub's runners.
+
+The Amazon S3 job (`aws-s3-test`) needs a CircleCI context named `s3_apk_test_rw`:
+
+- **Variables:** `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for an IAM user with the [`publish` policy](#iam-policy-for-publish) on the bucket, `AWS_REGION`, and `AWS_S3_BUCKET_NAME`. Without `AWS_S3_BUCKET_NAME` the job passes without testing.
+- **Cleanup:** each run writes under its own prefix, `apk-repo-orb-ci/<workflow>-<job>/`, and deletes nothing. Give the bucket a lifecycle rule that expires objects under `apk-repo-orb-ci/` after a day, and, in a versioned bucket, their noncurrent versions too.
 
 ## 🎨 Logo
 
