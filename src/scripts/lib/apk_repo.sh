@@ -10,7 +10,7 @@
 # instead of exiting: ar_get_object and ar_put_object return 0, or one of
 # the AR_* codes below.
 
-AR_TOOL_VERSION="0.1.0"
+AR_TOOL_VERSION="0.1.1"
 
 # The same patterns as apk_repo.py; tests/wiring_test.sh checks that.
 AR_NAME_RE='^[A-Za-z0-9][A-Za-z0-9._+-]*$'

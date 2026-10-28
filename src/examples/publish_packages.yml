@@ -13,7 +13,7 @@ description: >
 usage:
   version: 2.1
   orbs:
-    apk-repo: juburr/apk-repo-orb@0.1.0
+    apk-repo: juburr/apk-repo-orb@0.1.1
     melange: juburr/melange-orb@1.2.0
   jobs:
     publish-packages:
