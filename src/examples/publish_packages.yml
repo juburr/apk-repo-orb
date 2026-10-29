@@ -13,8 +13,8 @@ description: >
 usage:
   version: 2.1
   orbs:
-    apk-repo: juburr/apk-repo-orb@0.1.2
-    melange: juburr/melange-orb@1.2.2
+    apk-repo: juburr/apk-repo-orb@0.1.3
+    melange: juburr/melange-orb@1.3.0
   jobs:
     publish-packages:
       machine:
@@ -23,12 +23,13 @@ usage:
       steps:
         - checkout
         - melange/install
-        - run:
-            name: Build the packages
-            command: |
-              melange keygen build.rsa
-              melange build melange.yaml --runner docker --arch "$(uname -m)" \
-                --signing-key build.rsa --out-dir packages
+        # A build key: publish re-signs the packages with the production key.
+        - melange/keygen:
+            signing_key: build.rsa
+        # For this machine's architecture, into packages/<arch>.
+        - melange/build:
+            config: melange.yaml
+            signing_key: build.rsa
         - run:
             name: Use the job's OIDC token for AWS
             command: |
