@@ -102,9 +102,9 @@ Publish from one job, pull into another:
 version: 2.1
 
 orbs:
-  apk-repo: juburr/apk-repo-orb@0.1.2
-  apko: juburr/apko-orb@1.1.3
-  melange: juburr/melange-orb@1.2.2
+  apk-repo: juburr/apk-repo-orb@0.1.3
+  apko: juburr/apko-orb@1.2.1
+  melange: juburr/melange-orb@1.3.0
 
 jobs:
   publish:
@@ -113,12 +113,11 @@ jobs:
     steps:
       - checkout
       - melange/install
-      - run:
-          name: Build Packages
-          command: |
-            melange keygen build.rsa
-            melange build melange.yaml --runner docker --arch "$(uname -m)" \
-              --signing-key build.rsa --out-dir packages
+      - melange/keygen:
+          signing_key: build.rsa # a build key; publish re-signs with the production key
+      - melange/build: # for this machine's architecture, into packages/<arch>
+          config: melange.yaml
+          signing_key: build.rsa
       - apk-repo/publish:
           bucket: my-org-apk
           prefix: my-org/os
@@ -181,16 +180,19 @@ jobs:
       id-token: write # for OIDC to AWS
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: juburr/melange-orb/actions/install@v1.2.2
-      - run: |
-          melange keygen build.rsa
-          melange build melange.yaml --runner docker --arch "$(uname -m)" \
-            --signing-key build.rsa --out-dir packages
+      - uses: juburr/melange-orb/actions/install@v1.3.0
+      - uses: juburr/melange-orb/actions/keygen@v1.3.0
+        with:
+          signing_key: build.rsa # a build key; publish re-signs with the production key
+      - uses: juburr/melange-orb/actions/build@v1.3.0
+        with:
+          config: melange.yaml
+          signing_key: build.rsa
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.APK_PUBLISH_ROLE_ARN }}
           aws-region: us-east-1
-      - uses: juburr/apk-repo-orb/actions/publish@v0.1.2
+      - uses: juburr/apk-repo-orb/actions/publish@v0.1.3
         env:
           APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
         with:
@@ -359,20 +361,20 @@ Each command has a GitHub Action of the same name. The actions run the same scri
           role-to-assume: ${{ vars.APK_PULL_ROLE_ARN }}
           aws-region: us-east-1
       - id: pull
-        uses: juburr/apk-repo-orb/actions/pull@v0.1.2
+        uses: juburr/apk-repo-orb/actions/pull@v0.1.3
         with:
           bucket: my-org-apk
           prefix: my-org/os
           keyring: keys
       # pull has verified it already; verify checks a copy offline, such as
       # one a later job received as an artifact.
-      - uses: juburr/apk-repo-orb/actions/verify@v0.1.2
+      - uses: juburr/apk-repo-orb/actions/verify@v0.1.3
         with:
           dir: packages
           keyring: keys
           receipt_path: verify-receipt.json
-      - uses: juburr/apko-orb/actions/install@v1.1.3
-      - uses: juburr/apko-orb/actions/build@v1.1.3
+      - uses: juburr/apko-orb/actions/install@v1.2.1
+      - uses: juburr/apko-orb/actions/build@v1.2.1
         with:
           config: apko.yaml
           image: ghcr.io/my-org/app:latest
@@ -384,7 +386,7 @@ Each command has a GitHub Action of the same name. The actions run the same scri
 
 How they differ from the orb's commands:
 
-- **Versions.** Reference an action by the repository's release tag, such as `v0.1.2`, the tag the orb is published from, or for the strongest pinning by that tag's commit SHA: `juburr/apk-repo-orb/actions/publish@<sha> # v0.1.2`.
+- **Versions.** Reference an action by the repository's release tag, such as `v0.1.3`, the tag the orb is published from, or for the strongest pinning by that tag's commit SHA: `juburr/apk-repo-orb/actions/publish@<sha> # v0.1.3`.
 - **The signing key.** `signing_key` names an environment variable, as in the orb. Set it on the step from a secret (`env: APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}`), so it never appears as an input.
 - **Environment variables.** The orb expands `$NAME` in string parameters with the CircleCI CLI, which GitHub's runners don't have, so the actions take values as they are. Use GitHub's expressions instead.
 - **Runners.** GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners have everything the actions need, and CI runs every action on both.
