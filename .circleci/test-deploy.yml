@@ -5,8 +5,8 @@ orbs:
   orb-tools: circleci/orb-tools@12.5
   # The orb definition is intentionally not included here. It will be injected into the pipeline.
   apk-repo-orb: {}
-  melange-orb: juburr/melange-orb@1.2.0
-  apko-orb: juburr/apko-orb@1.1.0
+  melange-orb: juburr/melange-orb@1.2.2
+  apko-orb: juburr/apko-orb@1.1.3
 
 # Use this tag to ensure test jobs always run,
 # even though the downstream publish job will only run on release tags.
