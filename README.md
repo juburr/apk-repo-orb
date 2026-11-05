@@ -247,6 +247,27 @@ Architectures are published independently: one that fails doesn't undo another, 
 
 With `cache_dir`, a package from an earlier pull is reused when its SHA-256 matches its signed sidecar, and new packages are added. Save and restore it with `save_cache` and `restore_cache` (or `actions/cache`).
 
+### Pinned reads
+
+A pull normally takes whatever index is current. To pull the same snapshot again, for a rebuild or an audit, pin the index with the `index.sha256` (and, in a versioned bucket, the `index.version_id`) that an earlier receipt recorded:
+
+- `index_sha256`: the index must have exactly this SHA-256. It is compared as soon as the index is downloaded, before it is parsed or anything else is fetched, and the keyring must still verify its signature. Packages and their sidecars are never replaced or deleted, so pinning the index pins every package it lists.
+- `index_version_id`: read this version of the index (`GetObject` with a `versionId`), not the current one. It needs `index_sha256`: the version only says where to find the index, the SHA-256 which one to trust. It also needs `s3:GetObjectVersion` (see [Bucket Setup](#-bucket-setup)).
+
+With one architecture, give each as one value. With several, give space-separated `<arch>=<value>` pairs, one for each architecture in `arch`:
+
+```yaml
+- apk-repo/pull:
+    bucket: my-org-apk
+    prefix: my-org/os
+    keyring: keys
+    arch: x86_64 aarch64
+    index_sha256: x86_64=<64 hex> aarch64=<64 hex>
+    index_version_id: x86_64=<version> aarch64=<version>
+```
+
+With `index_sha256` alone, the pull fails once a publish has replaced the index: use it to make sure a build saw exactly the repository you reviewed. Add `index_version_id` to read a replaced index again. That works only as long as the bucket keeps the version: see [Versioning and lifecycle](#versioning-and-lifecycle). `verify` takes `index_sha256` too. Receipts of `pull` and `verify` record whether the index was pinned (`index.pinned`).
+
 `verify` makes the same checks on a local directory, offline, and warns about files the index doesn't list. Use it on what `pull` wrote in another job, or on a repository you copied by other means.
 
 ### Receipts
@@ -287,7 +308,7 @@ Every command writes JSON to `receipt_path` (default `apk-repo-receipt.json`) an
 }
 ```
 
-`packages` lists every package in the resulting (publish) or verified (pull, verify) index. `published`, `skipped_identical` and `attempts` appear for `publish` only. `version_id` is set in a versioned bucket. For `verify`, `index.key` is the local path, and `backend`, `endpoint_url`, `bucket`, `prefix` and `key_name` are `null`. Receipts never hold credentials or key material.
+`packages` lists every package in the resulting (publish) or verified (pull, verify) index. `published`, `skipped_identical` and `attempts` appear for `publish` only, and `index.pinned` (`true` when `index_sha256` pinned the index) for `pull` and `verify` only. `index.sha256` and `index.version_id` are the values a later pull pins (see [Pinned reads](#pinned-reads)). `version_id` is set in a versioned bucket. For `verify`, `index.key` is the local path, and `backend`, `endpoint_url`, `bucket`, `prefix` and `key_name` are `null`. Receipts never hold credentials or key material.
 
 ## 🧰 CircleCI Commands
 
@@ -329,6 +350,8 @@ Downloads the repository into `out_dir`, verified, as described in [Pulling and 
 | `arch` | `""` | `x86_64` and/or `aarch64`, space-separated. Empty is the machine's own (`uname -m`). |
 | `out_dir` | `packages` | Where to put the repository. Each `out_dir/<arch>` must not exist yet, or be empty. |
 | `cache_dir` | `""` | A directory of packages from earlier pulls, reused when they match their signed sidecars. Empty caches nothing. |
+| `index_sha256` | `""` | The SHA-256 the index must have, from an earlier receipt's `index.sha256`: one value, or `<arch>=<sha256>` pairs for several architectures. See [Pinned reads](#pinned-reads). Empty takes the current index. |
+| `index_version_id` | `""` | The version of the index to read in a versioned bucket, from the same receipt's `index.version_id`, in the same forms. Needs `index_sha256`. Empty reads the current version. |
 | `endpoint_url` | `""` | An S3-compatible service's endpoint. Empty is AWS. |
 | `region` | `""` | The bucket's region. |
 | `backend` | `s3` | Only `s3` for now. |
@@ -343,6 +366,7 @@ Verifies a local repository offline, with no network and no AWS CLI.
 | `keyring` | (required) | Space-separated public key files (`<key>.rsa.pub`) or directories of them, from your checkout. |
 | `dir` | `packages` | The repository directory, holding `<arch>/APKINDEX.tar.gz` and the packages. |
 | `arch` | `""` | `x86_64` and/or `aarch64`, space-separated. Empty is the machine's own. |
+| `index_sha256` | `""` | The SHA-256 the index must have, from the receipt of the pull or publish that made it: one value, or `<arch>=<sha256>` pairs. Empty checks only the signature. |
 | `receipt_path` | `apk-repo-receipt.json` | Where to write the receipt. |
 
 ## ⚡ GitHub Actions
@@ -423,6 +447,8 @@ Copy these and replace `my-org-apk` (the bucket), `my-org/os` (the prefix) and `
 > [!NOTE]
 > If a missing index still comes back as 403 (`Access … was denied`), grant `s3:ListBucket` on the bucket without the `s3:prefix` condition.
 
+To pull an earlier version of an index (`index_version_id`), also allow `s3:GetObjectVersion` on the same resource as `s3:GetObject`.
+
 ### IAM policy for `publish`
 
 The `pull` policy plus `s3:PutObject` on the prefix. Grant no `s3:DeleteObject` and no `s3:PutObjectAcl`: the orb never deletes or changes ACLs.
@@ -490,7 +516,7 @@ With this policy, copy operations (`CopyObject`) into the bucket fail, as AWS's 
 
 ### Versioning and lifecycle
 
-Turn on **versioning**: an index replaced by mistake can be restored, and receipts record each index's `version_id`. Add a lifecycle rule that **aborts incomplete multipart uploads** after a day. [Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html) can also keep every object version from being deleted or overwritten for a retention period; with a default retention, that includes each superseded version of the index.
+Turn on **versioning**: an index replaced by mistake can be restored, and receipts record each index's `version_id`, which a pinned pull can read again (`index_version_id`). A lifecycle rule that expires noncurrent versions makes those pulls fail once the version is gone, so keep noncurrent index versions for as long as you may need to pull them again. Add a lifecycle rule that **aborts incomplete multipart uploads** after a day. [Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html) can also keep every object version from being deleted or overwritten for a retention period; with a default retention, that includes each superseded version of the index.
 
 ### OIDC: no stored AWS keys
 
@@ -577,8 +603,8 @@ environment:
 
 ### What signatures can't tell you
 
-- **Freshness.** An index's signature proves who signed it, not that it is the latest. Someone who can write the bucket can put back an older signed index, or another prefix's index signed with the same key, and `pull` accepts it. Keep write access to the publishing role, turn on versioning, and compare the `etag` and `version_id` in receipts when it matters.
-- **The index's signature member.** As in every APK repository, the signature covers everything after the index's first gzip member, not that member's own header, so the index file's SHA-256 in a receipt identifies the bytes read, not a signed value. The packages are covered whole by their signed sidecars.
+- **Freshness.** An index's signature proves who signed it, not that it is the latest. Someone who can write the bucket can put back an older signed index, or another prefix's index signed with the same key, and an unpinned `pull` accepts it. Keep write access to the publishing role and turn on versioning. Where it matters, pin the index you expect with `index_sha256` (see [Pinned reads](#pinned-reads)), or compare the `sha256`, `etag` and `version_id` in receipts.
+- **The index's signature member.** As in every APK repository, the signature covers everything after the index's first gzip member, not that member's own header, so the index file's SHA-256 in a receipt identifies the bytes read, not a signed value. `index_sha256` pins those exact bytes, header included, and the signature is checked as well. The packages are covered whole by their signed sidecars.
 
 > [!IMPORTANT]
 > **Info for security teams:** see [Network Access](#-network-access) for the hosts to allow on locked-down or self-hosted runners.

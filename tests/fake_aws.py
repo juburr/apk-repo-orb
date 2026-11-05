@@ -17,7 +17,15 @@ real. Errors are printed as AWS CLI 2.34+ prints them, with exit code 254.
   FAKE_AWS_IGNORE_CONDITIONS=1
                             a backend that ignores If-Match and If-None-Match
   FAKE_AWS_NO_IF_MATCH=1    an old CLI, whose put-object can't take --if-match
-  FAKE_S3_VERSIONING=1      a versioned bucket: writes return a VersionId
+  FAKE_S3_VERSIONING=1      a versioned bucket: writes return a VersionId,
+                            and get-object --version-id reads any version
+                            written while it was set
+  FAKE_AWS_IGNORE_VERSION_ID=1
+                            a service that ignores --version-id, and
+                            returns the current object
+
+The log line of a GetObject with --version-id has version=<id> where
+other calls have their condition.
 """
 
 import base64
@@ -31,6 +39,8 @@ import sys
 ERRORS = {
     "403": ("AccessDenied", "Access Denied"),
     "404": ("NoSuchKey", "The specified key does not exist."),
+    "NoSuchVersion": ("NoSuchVersion", "The specified version does not exist."),
+    "InvalidVersion": ("InvalidArgument", "Invalid version id specified"),
     "409": ("ConditionalRequestConflict",
             "The conditional request cannot succeed due to a conflicting operation against this resource."),
     "412": ("PreconditionFailed", "At least one of the pre-conditions you specified did not hold"),
@@ -58,6 +68,10 @@ def parse(argv):
         arg = argv[i]
         if arg in flags:
             options[arg] = True
+            i += 1
+        elif arg.startswith("--") and "=" in arg:
+            name, value = arg.split("=", 1)
+            options[name] = value
             i += 1
         elif arg.startswith("--"):
             if i + 1 >= len(argv):
@@ -123,12 +137,16 @@ def main(argv):
     bucket, key = options.get("--bucket", ""), options.get("--key", "")
     operation = "GetObject" if positional[1] == "get-object" else "PutObject"
     condition = options.get("--if-none-match") and "if-none-match" or options.get("--if-match") and "if-match" or "none"
+    version_id = options.get("--version-id")
+    if version_id is not None and operation == "GetObject":
+        condition = "version=%s" % version_id
     log = os.environ.get("FAKE_AWS_LOG")
     if log:
         with open(log, "a") as stream:
             stream.write("%s %s %s %s\n" % (operation, key, condition, options.get("--endpoint-url", "-")))
     path = os.path.join(root, bucket, key)
     meta = os.path.join(root, ".meta", bucket, key + ".json")
+    versions = os.path.join(root, ".versions", bucket, key)
     with open(os.path.join(root, ".lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         status = rule_status(operation, key)
@@ -139,6 +157,16 @@ def main(argv):
         exists = os.path.isfile(path)
         current = json.load(open(meta)) if exists else {}
         if operation == "GetObject":
+            if version_id is not None and not os.environ.get("FAKE_AWS_IGNORE_VERSION_ID"):
+                if version_id == "null" and exists and not current.get("VersionId"):
+                    pass
+                elif os.path.isfile(os.path.join(versions, version_id)):
+                    path = os.path.join(versions, version_id)
+                    current = json.load(open(path + ".json"))
+                elif exists and current.get("VersionId") or os.path.isdir(versions):
+                    error(operation, "NoSuchVersion")
+                elif exists:
+                    error(operation, "InvalidVersion")
             if not exists:
                 error(operation, "404")
             with open(path, "rb") as source, open(positional[2], "wb") as target:
@@ -175,6 +203,12 @@ def main(argv):
                   "ChecksumSHA256": options.get("--checksum-sha256")}
         with open(meta, "w") as stream:
             json.dump(values, stream)
+        if version:
+            os.makedirs(versions, exist_ok=True)
+            with open(os.path.join(versions, version), "wb") as target:
+                target.write(body)
+            with open(os.path.join(versions, version + ".json"), "w") as stream:
+                json.dump(values, stream)
         output(options, {"ETag": values["ETag"], "VersionId": version})
     return 0
 

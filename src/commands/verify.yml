@@ -27,6 +27,16 @@ parameters:
       directories whose *.rsa.pub files are all trusted, from your
       checkout. A key is never taken from the repository itself.
       Environment variables are expanded.
+  index_sha256:
+    type: string
+    default: ""
+    description: >
+      The SHA-256 the index must have: the index.sha256 of the receipt of
+      the pull or publish that made it. One value for one architecture, or
+      space-separated <arch>=<sha256> pairs, one for each in arch. An index
+      with other bytes fails before it is read. Empty (the default) checks
+      only that the keyring verifies it. Environment variables are
+      expanded.
   receipt_path:
     type: string
     default: apk-repo-receipt.json
@@ -39,6 +49,7 @@ steps:
       environment:
         PARAM_ARCH: << parameters.arch >>
         PARAM_DIR: << parameters.dir >>
+        PARAM_INDEX_SHA256: << parameters.index_sha256 >>
         PARAM_KEYRING: << parameters.keyring >>
         PARAM_RECEIPT_PATH: << parameters.receipt_path >>
         SCRIPT_APK_REPO_LIB: << include(scripts/lib/apk_repo.sh) >>

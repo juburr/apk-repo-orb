@@ -29,6 +29,15 @@ inputs:
       checkout. A key is never taken from the repository itself.
       Environment variables are expanded.
     required: true
+  index_sha256:
+    default: ""
+    description: >
+      The SHA-256 the index must have: the index.sha256 of the receipt of
+      the pull or publish that made it. One value for one architecture, or
+      space-separated <arch>=<sha256> pairs, one for each in arch. An index
+      with other bytes fails before it is read. Empty (the default) checks
+      only that the keyring verifies it. Environment variables are
+      expanded.
   receipt_path:
     default: apk-repo-receipt.json
     description: >
@@ -50,6 +59,7 @@ runs:
       env:
         PARAM_ARCH: ${{ inputs.arch }}
         PARAM_DIR: ${{ inputs.dir }}
+        PARAM_INDEX_SHA256: ${{ inputs.index_sha256 }}
         PARAM_KEYRING: ${{ inputs.keyring }}
         PARAM_RECEIPT_PATH: ${{ inputs.receipt_path }}
       run: >-

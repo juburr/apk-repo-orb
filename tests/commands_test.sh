@@ -634,6 +634,123 @@ run pull PARAM_OUT_DIR=pulled
 check "F-12: a package without its sidecar fails" failed
 check "saying the repository is incomplete" said "The repository is incomplete"
 
+begin "P-9: pinned reads (index_sha256, index_version_id)"
+new_case
+package x86_64 hello 1.0.0-r0
+package aarch64 hello 1.0.0-r0
+FAKE_S3_VERSIONING=1 publish_new PARAM_ARCH="x86_64 aarch64"
+first_x86=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["architectures"]["x86_64"]["index"]["sha256"])' "${CASE}/apk-repo-receipt.json")
+first_arm=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["architectures"]["aarch64"]["index"]["sha256"])' "${CASE}/apk-repo-receipt.json")
+rm -rf "${CASE}/packages"
+package x86_64 world 2.0-r0
+package aarch64 world 2.0-r0
+FAKE_S3_VERSIONING=1 run publish PARAM_ARCH="x86_64 aarch64"
+current_x86=$(sha256sum < "$(s3 test/os/x86_64/APKINDEX.tar.gz)")
+current_x86=${current_x86%% *}
+check "(a second publish replaced the index with version v2)" [ "${current_x86}" != "${first_x86}" ]
+: > "${CASE}/aws.log"
+FAKE_S3_VERSIONING=1 run pull PARAM_OUT_DIR=current PARAM_INDEX_SHA256="${current_x86}"
+check "the current index's SHA-256 pins it" succeeded
+check "saying so" said "is the ${current_x86} index_sha256 pins"
+check "and the receipt records the pull as pinned" json_is "${CASE}/apk-repo-receipt.json" 'r["architectures"]["x86_64"]["index"]["pinned"], r["architectures"]["x86_64"]["index"]["sha256"] == "'"${current_x86}"'"' "(True, True)"
+FAKE_S3_VERSIONING=1 run pull PARAM_OUT_DIR=upper PARAM_INDEX_SHA256="${current_x86^^}"
+check "a SHA-256 in upper case works too" succeeded
+: > "${CASE}/aws.log"
+FAKE_S3_VERSIONING=1 run pull PARAM_OUT_DIR=stale PARAM_INDEX_SHA256="${first_x86}"
+check "an index with other bytes fails (1)" exited 1
+check "naming both SHA-256s" said "SHA-256 is ${current_x86}, not the ${first_x86} index_sha256 pins"
+check "suggesting index_version_id" said "set index_version_id too"
+check "before anything but the index is read" [ "$(grep -c '^GetObject' "${CASE}/aws.log")" -eq 1 ]
+check "leaving out_dir empty" absent "${CASE}/stale/x86_64"
+: > "${CASE}/aws.log"
+FAKE_S3_VERSIONING=1 run pull PARAM_OUT_DIR=snapshot PARAM_INDEX_SHA256="${first_x86}" PARAM_INDEX_VERSION_ID=v1
+check "with index_version_id, the earlier snapshot is pulled again" succeeded
+check "reading that version of the index" logged '^GetObject test/os/x86_64/APKINDEX.tar.gz version=v1 '
+check "and only the version of the index" [ "$(grep -c 'version=' "${CASE}/aws.log")" -eq 1 ]
+check "with the packages it lists" exists "${CASE}/snapshot/x86_64/hello-1.0.0-r0.apk"
+check "and none it doesn't" absent "${CASE}/snapshot/x86_64/world-2.0-r0.apk"
+check "recording the version in the receipt" json_is "${CASE}/apk-repo-receipt.json" 'r["architectures"]["x86_64"]["index"]["version_id"], r["architectures"]["x86_64"]["index"]["sha256"] == "'"${first_x86}"'"' "('v1', True)"
+run verify PARAM_DIR=snapshot PARAM_INDEX_SHA256="${first_x86}"
+check "verify accepts the snapshot with the same pin" succeeded
+check "and records it as pinned" json_is "${CASE}/apk-repo-receipt.json" 'r["architectures"]["x86_64"]["index"]["pinned"]' "True"
+run verify PARAM_DIR=current PARAM_INDEX_SHA256="${first_x86}"
+check "verify refuses another index (1)" exited 1
+check "saying it isn't the one pinned" said "This isn't the index pinned"
+run verify PARAM_DIR=current
+check "an unpinned verify records pinned: false" json_is "${CASE}/apk-repo-receipt.json" 'r["architectures"]["x86_64"]["index"]["pinned"]' "False"
+FAKE_S3_VERSIONING=1 run pull PARAM_OUT_DIR=mixed PARAM_INDEX_SHA256="${first_x86}" PARAM_INDEX_VERSION_ID=v2
+check "a version that isn't the pinned index fails (1)" exited 1
+check "saying to take both from the same receipt" said "from the same receipt"
+check "with nothing in out_dir" absent "${CASE}/mixed/x86_64"
+FAKE_S3_VERSIONING=1 run pull PARAM_OUT_DIR=gone PARAM_INDEX_SHA256="${first_x86}" PARAM_INDEX_VERSION_ID=v9
+check "a version that doesn't exist fails (1)" exited 1
+check "naming it" said "has no version v9 (index_version_id)"
+FAKE_S3_VERSIONING=1 run pull PARAM_OUT_DIR=dash PARAM_INDEX_SHA256="${first_x86}" PARAM_INDEX_VERSION_ID=-v1
+check "a version ID starting with - reaches S3 as a version, not an option" said "has no version -v1"
+FAKE_S3_VERSIONING=1 FAKE_AWS_IGNORE_VERSION_ID=1 run pull PARAM_OUT_DIR=ignored PARAM_INDEX_SHA256="${first_x86}" PARAM_INDEX_VERSION_ID=v1
+check "a service that ignores the version fails (1)" exited 1
+check "saying it may not support versions" said "may not support object versions"
+echo "GetObject .*/APKINDEX.tar.gz 403" > "${CASE}/rules"
+FAKE_S3_VERSIONING=1 run pull PARAM_OUT_DIR=denied PARAM_INDEX_SHA256="${first_x86}" PARAM_INDEX_VERSION_ID=v1
+check "a denied version fails" exited 1
+check "E-3: naming s3:GetObjectVersion" said "s3:GetObjectVersion"
+: > "${CASE}/rules"
+FAKE_S3_VERSIONING=1 run pull PARAM_ARCH="x86_64 aarch64" PARAM_OUT_DIR=both \
+    PARAM_INDEX_SHA256="aarch64=${first_arm} x86_64=${first_x86}" PARAM_INDEX_VERSION_ID="x86_64=v1 aarch64=v1"
+check "<arch>=<value> pairs pin each architecture" succeeded
+check "to its own snapshot" json_is "${CASE}/apk-repo-receipt.json" 'sorted((a, len(x["packages"]), x["index"]["pinned"]) for a, x in r["architectures"].items())' "[('aarch64', 1, True), ('x86_64', 1, True)]"
+: > "${CASE}/aws.log"
+# refused DESCRIPTION MESSAGE NAME=VALUE...: a pull of both architectures
+# with these settings is a usage error (2), saying MESSAGE.
+refused() {
+    local description=$1 message=$2
+    shift 2
+    run pull PARAM_ARCH="x86_64 aarch64" PARAM_OUT_DIR=refused "$@"
+    check "a usage error (2): ${description}" exited 2
+    check "saying so" said "${message}"
+}
+refused "one value for two architectures" "index_sha256 gives one value for 2 architectures (x86_64 aarch64)" \
+    PARAM_INDEX_SHA256="${first_x86}"
+refused "a pair for one of two architectures" "index_sha256 gives no value for aarch64" \
+    PARAM_INDEX_SHA256="x86_64=${first_x86}"
+refused "an architecture twice" "index_sha256 gives x86_64 more than once" \
+    PARAM_INDEX_SHA256="x86_64=${first_x86} aarch64=${first_arm} x86_64=${first_x86}"
+refused "an unknown architecture" "must be <arch>=<value>, with x86_64 or aarch64 as <arch>" \
+    PARAM_INDEX_SHA256="x86_64=${first_x86} riscv64=${first_arm}"
+refused "a pair and a bare value" "must be <arch>=<value>" \
+    PARAM_INDEX_SHA256="x86_64=${first_x86} ${first_arm}"
+refused "a pair whose value isn't a SHA-256" "index_sha256 for x86_64, 'nothex', isn't a SHA-256" \
+    PARAM_INDEX_SHA256="x86_64=nothex aarch64=${first_arm}"
+refused "a version without index_sha256" "index_version_id needs index_sha256" \
+    PARAM_INDEX_VERSION_ID="x86_64=v1 aarch64=v1"
+run pull PARAM_OUT_DIR=refused "PARAM_INDEX_SHA256=aarch64=${first_arm}"
+check "a usage error (2) for a pair naming an arch that isn't pulled" exited 2
+check "saying arch doesn't list it" said "gives a value for aarch64, which arch doesn't list (x86_64)"
+run pull PARAM_OUT_DIR=refused PARAM_INDEX_SHA256="${first_x86:0:63}"
+check "a usage error (2) for a SHA-256 one character short" exited 2
+check "saying what it must be" said "isn't a SHA-256 in hex (64 characters)"
+run pull PARAM_OUT_DIR=refused PARAM_INDEX_SHA256="${first_x86}" PARAM_INDEX_VERSION_ID='v1;x'
+check "a usage error (2) for a version ID with other characters" exited 2
+check "saying what it must be" said "isn't an S3 version ID"
+run pull PARAM_OUT_DIR=refused PARAM_INDEX_SHA256="${first_x86}" PARAM_INDEX_VERSION_ID="$(printf 'v%.0s' $(seq 1025))"
+check "a usage error (2) for a version ID over 1024 characters" exited 2
+check "saying so" said "an S3 version ID is at most 1024"
+run pull PARAM_OUT_DIR=refused PARAM_INDEX_SHA256='*'
+check "a usage error (2) for a value that is a glob" exited 2
+check "taken as it is, not as the files it matches" said "index_sha256 '*' isn't a SHA-256"
+run verify PARAM_DIR=snapshot PARAM_INDEX_SHA256=nothex
+check "verify: a usage error (2) for a value that isn't a SHA-256" exited 2
+check "no AWS call was made for any of them" not_logged '.'
+new_case
+package x86_64 hello 1.0.0-r0
+publish_new
+pinned=$(sha256sum < "$(s3 test/os/x86_64/APKINDEX.tar.gz)")
+run pull PARAM_OUT_DIR=null PARAM_INDEX_SHA256="${pinned%% *}" PARAM_INDEX_VERSION_ID=null
+check "the version null is an object written before versioning" succeeded
+run pull PARAM_OUT_DIR=unversioned PARAM_INDEX_SHA256="${pinned%% *}" PARAM_INDEX_VERSION_ID=v1
+check "another version in an unversioned bucket fails (1)" exited 1
+check "with the service's message" said "Invalid version id specified"
+
 # ------------------------------------------------------------------ edges
 echo "=== edge cases"
 
