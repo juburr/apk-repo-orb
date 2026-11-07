@@ -751,6 +751,91 @@ run pull PARAM_OUT_DIR=unversioned PARAM_INDEX_SHA256="${pinned%% *}" PARAM_INDE
 check "another version in an unversioned bucket fails (1)" exited 1
 check "with the service's message" said "Invalid version id specified"
 
+# ------------------------------------------------------------------ inspect
+echo "=== inspect"
+
+begin "I-1, I-2: what the index lists"
+new_case
+package x86_64 hello 1.0.0-r0
+package x86_64 world 2.1-r3
+package aarch64 hello 1.0.0-r0
+FAKE_S3_VERSIONING=1 publish_new PARAM_ARCH="x86_64 aarch64"
+first_x86=$(sha256sum < "$(s3 test/os/x86_64/APKINDEX.tar.gz)")
+first_x86=${first_x86%% *}
+: > "${CASE}/aws.log"
+FAKE_S3_VERSIONING=1 run inspect PARAM_ARCH="x86_64 aarch64"
+check "succeeds for both architectures" succeeded
+check "I-1: reading each architecture's index" logged '^GetObject test/os/x86_64/APKINDEX.tar.gz ' && logged '^GetObject test/os/aarch64/APKINDEX.tar.gz '
+check "and nothing else" [ "$(grep -c . "${CASE}/aws.log")" -eq 2 ]
+check "I-1: writing nothing to the bucket" not_logged '^PutObject'
+check "or to the working directory but the receipt" [ -z "$(find "${CASE}" -mindepth 1 -maxdepth 1 ! -name s3 ! -name tmp ! -name bash_env \
+    ! -name aws.log ! -name rules ! -name packages ! -name apk-repo-receipt.json)" ]
+check "I-2: listing every package of each index" json_is "${CASE}/apk-repo-receipt.json" '{a: [(p["name"], p["version"], p["file"]) for p in x["packages"]] for a, x in r["architectures"].items()}' \
+    "{'aarch64': [('hello', '1.0.0-r0', 'hello-1.0.0-r0.apk')], 'x86_64': [('hello', '1.0.0-r0', 'hello-1.0.0-r0.apk'), ('world', '2.1-r3', 'world-2.1-r3.apk')]}"
+check "with the size the index gives" json_is "${CASE}/apk-repo-receipt.json" '[p["size"] for p in r["architectures"]["x86_64"]["packages"]]' \
+    "[$(stat -c %s "$(s3 test/os/x86_64/hello-1.0.0-r0.apk)"), $(stat -c %s "$(s3 test/os/x86_64/world-2.1-r3.apk)")]"
+check "and no SHA-256, since no sidecar is read" json_is "${CASE}/apk-repo-receipt.json" 'set(p["sha256"] for x in r["architectures"].values() for p in x["packages"])' "{None}"
+check "recording the operation" json_is "${CASE}/apk-repo-receipt.json" 'r["operation"], r["key_name"], r["prefix"]' "('inspect', None, 'test/os')"
+check "and the index read, as a later pin needs it" json_is "${CASE}/apk-repo-receipt.json" \
+    '[r["architectures"]["x86_64"]["index"][k] for k in ("version_id", "signature", "pinned")], r["architectures"]["x86_64"]["index"]["sha256"] == "'"${first_x86}"'"' \
+    "(['v1', '.SIGN.RSA256.test-apk.rsa.pub', False], True)"
+check "saying how many packages each index lists" said "Inspected x86_64: an index signed with test-apk.rsa that lists 2 package(s)."
+check "O-2: exports the receipt's path" file_has "${CASE}/bash_env" "export APK_REPO_RECEIPT=${CASE}/apk-repo-receipt.json"
+run inspect PARAM_KEYRING="${WORK}/other-keyring"
+check "I-4: an index signed with a key the keyring lacks fails" failed
+check "naming the keyring file it needs" said "the keyring has no test-apk.rsa.pub"
+check "and writes no receipt" absent "${CASE}/apk-repo-receipt.json"
+rm -rf "${CASE}/packages"
+package x86_64 later 3.0-r0
+FAKE_S3_VERSIONING=1 run publish
+FAKE_S3_VERSIONING=1 run inspect PARAM_INDEX_SHA256="${first_x86}"
+check "I-5: a pin to a replaced index fails" exited 1
+check "suggesting index_version_id" said "set index_version_id too"
+FAKE_S3_VERSIONING=1 run inspect PARAM_INDEX_SHA256="${first_x86}" PARAM_INDEX_VERSION_ID=v1
+check "I-5: with its version, the replaced index is inspected again" succeeded
+check "listing what it listed then" json_is "${CASE}/apk-repo-receipt.json" '[p["file"] for p in r["architectures"]["x86_64"]["packages"]], r["architectures"]["x86_64"]["index"]["pinned"]' \
+    "(['hello-1.0.0-r0.apk', 'world-2.1-r3.apk'], True)"
+FAKE_S3_VERSIONING=1 run inspect
+check "and without a pin, the current one" json_is "${CASE}/apk-repo-receipt.json" 'sorted(p["file"] for p in r["architectures"]["x86_64"]["packages"])' \
+    "['hello-1.0.0-r0.apk', 'later-3.0-r0.apk', 'world-2.1-r3.apk']"
+
+begin "I-3: no repository yet"
+new_case
+run inspect
+check "a missing index fails (1)" exited 1
+check "saying there is no repository" said "There is no repository at s3://bucket/test/os/x86_64"
+check "and writes no receipt" absent "${CASE}/apk-repo-receipt.json"
+run inspect PARAM_ALLOW_MISSING=true
+check "allow_missing reports it as empty" succeeded
+check "saying so" said "allow_missing reports it as empty"
+check "with a null index and no packages" json_is "${CASE}/apk-repo-receipt.json" 'r["architectures"]' "{'x86_64': {'index': None, 'packages': []}}"
+run inspect PARAM_ALLOW_MISSING=1
+check "allow_missing takes CircleCI's 1 for true" succeeded
+run inspect PARAM_ALLOW_MISSING=yes
+check "and refuses anything but a boolean (2)" exited 2
+echo "GetObject .*/APKINDEX.tar.gz 403" > "${CASE}/rules"
+run inspect PARAM_ALLOW_MISSING=true
+check "E-3: a 403 fails even with allow_missing, since it may hide an index" exited 1
+check "suggesting s3:ListBucket" said "s3:ListBucket"
+: > "${CASE}/rules"
+run inspect PARAM_ALLOW_MISSING=true PARAM_INDEX_SHA256="$(printf '0%.0s' $(seq 64))"
+check "a missing index that index_sha256 pins fails even with allow_missing" exited 1
+check "saying there is no repository" said "There is no repository at"
+package x86_64 hello 1.0.0-r0
+publish_new
+run inspect PARAM_ARCH="x86_64 aarch64" PARAM_ALLOW_MISSING=true
+check "with two architectures, one of them published" succeeded
+check "reports the one with an index, and the other as empty" json_is "${CASE}/apk-repo-receipt.json" \
+    '{a: (x["index"] is not None, len(x["packages"])) for a, x in r["architectures"].items()}' "{'aarch64': (False, 0), 'x86_64': (True, 1)}"
+: > "${CASE}/aws.log"
+run inspect PARAM_PREFIX=$'ok\n../../other/os'
+check "a usage error (2) for a bad prefix" exited 2
+run inspect PARAM_BUCKET=
+check "and for no bucket" exited 2
+run inspect PARAM_INDEX_VERSION_ID=v1
+check "and for a version without index_sha256" exited 2
+check "before any AWS call" not_logged '.'
+
 # ------------------------------------------------------------------ edges
 echo "=== edge cases"
 

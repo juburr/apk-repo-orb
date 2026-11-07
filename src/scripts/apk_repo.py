@@ -41,6 +41,9 @@ Commands:
       Writes the JSON receipt from the files the scripts left in WORKDIR
       (meta.tsv, and arch/<arch>/index.tsv, packages.tsv, published,
       skipped_identical, attempts), through a temporary file it renames.
+      An index.tsv with "missing true" (inspect's allow_missing) makes the
+      architecture's index null, and an empty SHA-256 in packages.tsv
+      (inspect reads no sidecar) a null one.
 
 Exit codes: 0 success, 1 a file it refuses (with an ERROR: line on
 stderr), 2 usage.
@@ -396,13 +399,17 @@ def command_receipt(out, workdir):
                 "signature": index.get("signature", ""),
             },
             "packages": [
-                {"name": row[0], "version": row[1], "file": row[2], "sha256": row[3], "size": int(row[4])}
+                # inspect reads no sidecar, so it knows no package's SHA-256.
+                {"name": row[0], "version": row[1], "file": row[2], "sha256": nullable(row[3]), "size": int(row[4])}
                 for row in read_tsv(os.path.join(directory, "packages.tsv"))
             ],
         }
         if operation != "publish":
-            # pull and verify: whether index_sha256 pinned the index.
+            # pull, verify and inspect: whether index_sha256 pinned the index.
             result["index"]["pinned"] = index.get("pinned") == "true"
+        if index.get("missing") == "true":
+            # inspect with allow_missing: no repository for this arch yet.
+            result["index"] = None
         if operation == "publish":
             result["published"] = read_lines(os.path.join(directory, "published"))
             result["skipped_identical"] = read_lines(os.path.join(directory, "skipped_identical"))

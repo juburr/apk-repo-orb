@@ -16,7 +16,9 @@
 #     high-level `aws s3` command, deletes anything, or writes with
 #     put-object without --if-match or --if-none-match (U-12), and the
 #     orb's own code calls no s3api operation but get-object and put-object;
-#   - tests/run_command.sh runs each command's own script.
+#   - tests/run_command.sh runs each command's own script;
+#   - the version receipts report (AR_TOOL_VERSION) is the one the
+#     examples and the README pin, so a release can't ship with another.
 #
 # Run from a checkout:
 #   bash tests/wiring_test.sh
@@ -226,8 +228,22 @@ for yml in src/commands/*.yml; do
     fi
 done
 
+# The version receipts report, and the one the examples and the README pin.
+tool_version=$(sed -nE 's/^AR_TOOL_VERSION="(.*)"$/\1/p' src/scripts/lib/apk_repo.sh)
+if [[ -z "${tool_version}" ]]; then
+    fail "lib/apk_repo.sh sets no AR_TOOL_VERSION"
+fi
+while IFS= read -r pinned; do
+    if [[ "${pinned}" != *"@${tool_version}" && "${pinned}" != *"@v${tool_version}" ]]; then
+        fail "AR_TOOL_VERSION is ${tool_version}, but ${pinned} pins another version"
+    fi
+done < <(grep -oHE 'juburr/apk-repo-orb(/actions/[a-z]+)?@v?[0-9]+\.[0-9]+\.[0-9]+' src/examples/*.yml README.md)
+if ! grep -qE "juburr/apk-repo-orb@${tool_version//./\\.}\$" src/examples/*.yml; then
+    fail "no example pins juburr/apk-repo-orb@${tool_version}"
+fi
+
 if [[ "${FAILURES}" -gt 0 ]]; then
     echo "${FAILURES} failure(s)"
     exit 1
 fi
-echo "ok: every command passes every parameter and helper its script reads, names its run steps and has a README section; the lib and the Python helper agree; no write is unconditional and nothing is deleted (T-8)"
+echo "ok: every command passes every parameter and helper its script reads, names its run steps and has a README section; the lib and the Python helper agree; no write is unconditional and nothing is deleted (T-8); the examples pin the version receipts report"

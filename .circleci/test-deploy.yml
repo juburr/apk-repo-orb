@@ -84,6 +84,22 @@ commands:
             print("Published", published, "to", receipt["bucket"], "at", receipt["prefix"])
             print("The index's version_id is", index["version_id"])
             EOF
+  # inspect saw no repository before the publish (allow_missing), and the package after it.
+  check-inspect-receipts:
+    steps:
+      - run:
+          name: Check the inspect receipts
+          command: |
+            python3 -I - inspect-before.json inspect-after.json "$(uname -m)" \<< 'EOF'
+            import json, sys
+            before, after, arch = (json.load(open(sys.argv[1])), json.load(open(sys.argv[2])), sys.argv[3])
+            assert before["operation"] == after["operation"] == "inspect"
+            assert before["architectures"][arch] == {"index": None, "packages": []}, before
+            packages = after["architectures"][arch]["packages"]
+            assert [p["file"] for p in packages] == ["apk-repo-hello-0.0.1-r0.apk"], packages
+            assert packages[0]["sha256"] is None and packages[0]["size"] > 0, packages
+            print("Before publishing, no repository; after,", [p["file"] for p in packages])
+            EOF
   # apko builds an image from the pulled repository, which must run the package's script.
   run-test-image:
     steps:
@@ -166,6 +182,13 @@ jobs:
           name: Start the S3 server
           command: bash tests/s3_server.sh apk-repo-e2e
       - make-test-package
+      - apk-repo-orb/inspect:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          allow_missing: true
+          receipt_path: inspect-before.json
       - apk-repo-orb/publish:
           bucket: apk-repo-e2e
           prefix: e2e/os
@@ -174,6 +197,13 @@ jobs:
           key_name: apk-repo-test.rsa
           allow_create: true
       - check-publish-receipt
+      - apk-repo-orb/inspect:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          receipt_path: inspect-after.json
+      - check-inspect-receipts
       - apk-repo-orb/pull:
           bucket: apk-repo-e2e
           prefix: e2e/os
@@ -218,6 +248,12 @@ jobs:
             RACE_ROUNDS: "10"
       - make-test-package
       # The orb's commands expand the variables in their parameters.
+      - apk-repo-orb/inspect:
+          bucket: ${AWS_S3_BUCKET_NAME}
+          prefix: ${APK_REPO_TEST_PREFIX}/e2e/os
+          keyring: keyring
+          allow_missing: true
+          receipt_path: inspect-before.json
       - apk-repo-orb/publish:
           bucket: ${AWS_S3_BUCKET_NAME}
           prefix: ${APK_REPO_TEST_PREFIX}/e2e/os
@@ -225,6 +261,12 @@ jobs:
           key_name: apk-repo-test.rsa
           allow_create: true
       - check-publish-receipt
+      - apk-repo-orb/inspect:
+          bucket: ${AWS_S3_BUCKET_NAME}
+          prefix: ${APK_REPO_TEST_PREFIX}/e2e/os
+          keyring: keyring
+          receipt_path: inspect-after.json
+      - check-inspect-receipts
       - apk-repo-orb/pull:
           bucket: ${AWS_S3_BUCKET_NAME}
           prefix: ${APK_REPO_TEST_PREFIX}/e2e/os
