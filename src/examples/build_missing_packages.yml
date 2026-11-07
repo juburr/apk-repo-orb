@@ -1,0 +1,61 @@
+description: >
+  Build and publish a package only when the repository doesn't have its
+  version yet. inspect reads and verifies each architecture's index, and
+  nothing else, and lists the packages it holds in its receipt. When this
+  machine's architecture has my-package 1.2.3-r0 already, the job stops
+  there and succeeds; otherwise it builds the package and publishes it.
+  allow_missing lets the first run, before anything is published, see an
+  empty repository. inspect is a hint, not a lock: if another job publishes
+  the same version first, publish compares the two builds, and fails if
+  they differ. The job signs in to AWS with CircleCI's OIDC token, as the
+  publish_packages example does.
+
+usage:
+  version: 2.1
+  orbs:
+    apk-repo: juburr/apk-repo-orb@0.3.0
+    melange: juburr/melange-orb@1.3.0
+  jobs:
+    build-if-missing:
+      machine:
+        image: ubuntu-2404:current
+      environment:
+        # <name>-<version>-r<epoch>.apk, from melange.yaml's package section.
+        PACKAGE_FILE: my-package-1.2.3-r0.apk
+      steps:
+        - checkout
+        - run:
+            name: Use the job's OIDC token for AWS
+            command: |
+              printf '%s' "${CIRCLE_OIDC_TOKEN_V2}" > /tmp/aws-web-identity-token
+              printf 'export AWS_WEB_IDENTITY_TOKEN_FILE=%q\n' /tmp/aws-web-identity-token >> "${BASH_ENV}"
+        - apk-repo/inspect:
+            bucket: my-org-apk
+            prefix: my-org/os
+            keyring: keys
+            allow_missing: true
+        - run:
+            name: Stop if this version is published already
+            command: |
+              if jq -e --arg file "${PACKAGE_FILE}" --arg arch "$(uname -m)" \
+                  '.architectures[$arch].packages | any(.file == $file)' "${APK_REPO_RECEIPT}" > /dev/null; then
+                echo "${PACKAGE_FILE} is in the repository already; nothing to build."
+                circleci-agent step halt
+              fi
+        - melange/install
+        - melange/keygen:
+            signing_key: build.rsa
+        - melange/build:
+            config: melange.yaml
+            signing_key: build.rsa
+        - apk-repo/publish:
+            bucket: my-org-apk
+            prefix: my-org/os
+            keyring: keys
+            key_name: my-org-apk.rsa
+            allow_create: true
+  workflows:
+    build:
+      jobs:
+        - build-if-missing:
+            context: apk-publishing

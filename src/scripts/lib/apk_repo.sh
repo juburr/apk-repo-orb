@@ -10,7 +10,7 @@
 # instead of exiting: ar_get_object and ar_put_object return 0, or one of
 # the AR_* codes below.
 
-AR_TOOL_VERSION="0.2.0"
+AR_TOOL_VERSION="0.3.0"
 
 # The same patterns as apk_repo.py; tests/wiring_test.sh checks that.
 AR_NAME_RE='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
@@ -274,6 +274,76 @@ ar_check_pinned_index() {
         ar_die "${what}'s SHA-256 is ${actual}, not the ${pinned} index_sha256 pins." "$@"
     fi
     echo "${what}'s SHA-256 is the ${pinned} index_sha256 pins."
+}
+
+# ar_index_pins INDEX_SHA256 INDEX_VERSION_ID: fills AR_PIN_SHA256[arch] and
+# AR_PIN_VERSION_ID[arch] for each of AR_ARCHES from the index_sha256 and
+# index_version_id parameters (scripts declare -A both first). A version
+# needs a SHA-256: the version says where to find the index, the SHA-256
+# which one to trust.
+# shellcheck disable=SC2004 # associative arrays, which the scripts declare
+ar_index_pins() {
+    local arch
+    for arch in "${AR_ARCHES[@]}"; do
+        AR_PIN_SHA256[${arch}]=$(ar_index_sha256 index_sha256 "$1" "${arch}") || exit $?
+        AR_PIN_VERSION_ID[${arch}]=$(ar_index_version_id index_version_id "$2" "${arch}") || exit $?
+        if [[ -n "${AR_PIN_VERSION_ID[${arch}]}" && -z "${AR_PIN_SHA256[${arch}]}" ]]; then
+            ar_usage "index_version_id needs index_sha256: the version says where to find the index, its SHA-256 which one to trust." \
+                "Give both from the same receipt (index.sha256 and index.version_id)."
+        fi
+    done
+}
+
+# ar_read_index ARCH KEY OUT WORKDIR [ALLOW_MISSING]: downloads the index KEY
+# (<prefix>/<arch>/APKINDEX.tar.gz) to OUT, or the version AR_PIN_VERSION_ID
+# pins, requires the SHA-256 AR_PIN_SHA256 pins, and verifies it into
+# WORKDIR (ar_verify_index). Sets AR_INDEX_ETAG and AR_INDEX_VERSION_ID. A
+# missing index fails, unless ALLOW_MISSING is true and nothing is pinned:
+# then it returns AR_ABSENT. A 403 always fails: it may hide an index.
+ar_read_index() {
+    local arch=$1 key=$2 out=$3 work=$4 allow_missing=${5:-false} status expected
+    local pinned_sha256=${AR_PIN_SHA256[$1]:-} pinned_version=${AR_PIN_VERSION_ID[$1]:-}
+    status=0
+    ar_get_object "${key}" "${out}" "${pinned_version}" || status=$?
+    case "${status}" in
+        0) ;;
+        "${AR_ABSENT}")
+            if [[ -n "${pinned_version}" ]]; then
+                ar_die "$(ar_s3_url "${key}") has no version ${pinned_version} (index_version_id)." \
+                    "Check that it comes from a receipt for this bucket, prefix and arch, and that the version wasn't deleted or expired."
+            fi
+            if [[ "${allow_missing}" == "true" && -z "${pinned_sha256}" ]]; then
+                return "${AR_ABSENT}"
+            fi
+            ar_die "There is no repository at $(ar_s3_url "${key%/*}"): ${key} doesn't exist." \
+                "Check bucket, prefix and arch, or publish to it first." ;;
+        "${AR_DENIED}")
+            if [[ -n "${pinned_version}" ]]; then
+                ar_die "Access to version ${pinned_version} of $(ar_s3_url "${key}") was denied. It may not exist." \
+                    "Reading a version needs s3:GetObjectVersion on $(ar_s3_url "${key%/*/*}")/* as well as s3:GetObject (README: Bucket Setup)."
+            fi
+            ar_die "Access to $(ar_s3_url "${key}") was denied. It may not exist." "$(ar_denied_hint "${key}")" ;;
+    esac
+    AR_INDEX_ETAG=${AR_ETAG}
+    AR_INDEX_VERSION_ID=${AR_VERSION_ID}
+    echo "Read $(ar_s3_url "${key}") (ETag ${AR_INDEX_ETAG}${AR_INDEX_VERSION_ID:+, version ${AR_INDEX_VERSION_ID}})."
+    # A service that ignores versionId would answer with the current index.
+    # ar_get_object reports the version "null" as none.
+    expected=${pinned_version}
+    [[ "${expected}" == "null" ]] && expected=""
+    if [[ -n "${pinned_version}" && "${AR_INDEX_VERSION_ID}" != "${expected}" ]]; then
+        ar_die "Asked for version ${pinned_version} of $(ar_s3_url "${key}"), the service returned ${AR_INDEX_VERSION_ID:-an unversioned object}." \
+            "The service may not support object versions; pin index_sha256 alone there."
+    fi
+    if [[ -n "${pinned_version}" ]]; then
+        ar_check_pinned_index "${out}" "${pinned_sha256}" "$(ar_s3_url "${key}") version ${pinned_version}" \
+            "That version isn't the index pinned: take index_sha256 and index_version_id from the same receipt."
+    else
+        ar_check_pinned_index "${out}" "${pinned_sha256}" "$(ar_s3_url "${key}")" \
+            "The index has changed since. To read the pinned one again from a versioned bucket, set index_version_id too" \
+            "(the receipt's index.version_id)."
+    fi
+    ar_verify_index "${out}" "${arch}" "${work}"
 }
 
 # ar_check_prefix VALUE: F-2's prefix rule, matched against the whole value

@@ -124,6 +124,15 @@ jobs:
         with:
           config: tests/fixtures/melange.yaml
           signing_key: build.rsa
+      - id: inspect-before
+        uses: ./actions/inspect
+        with:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          allow_missing: "true"
+          receipt_path: inspect-before.json
       - id: publish
         uses: ./actions/publish
         with:
@@ -146,6 +155,33 @@ jobs:
           assert published == ["apk-repo-hello-0.0.1-r0.apk"], published
           assert receipt["architectures"][arch]["index"]["signature"] == ".SIGN.RSA256.apk-repo-test.rsa.pub"
           print("Published", published)
+          EOF
+      - id: inspect-after
+        uses: ./actions/inspect
+        with:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          receipt_path: inspect-after.json
+      # inspect saw no repository before the publish (allow_missing), and
+      # the package after it.
+      - name: Check the inspect receipts
+        env:
+          BEFORE: ${{ steps.inspect-before.outputs.receipt }}
+          AFTER: ${{ steps.inspect-after.outputs.receipt }}
+        run: |
+          [[ "${BEFORE}" == "${GITHUB_WORKSPACE}/inspect-before.json" ]]
+          [[ "${AFTER}" == "${GITHUB_WORKSPACE}/inspect-after.json" ]]
+          python3 -I - "${BEFORE}" "${AFTER}" "$(uname -m)" << 'EOF'
+          import json, sys
+          before, after, arch = (json.load(open(sys.argv[1])), json.load(open(sys.argv[2])), sys.argv[3])
+          assert before["operation"] == after["operation"] == "inspect"
+          assert before["architectures"][arch] == {"index": None, "packages": []}, before
+          packages = after["architectures"][arch]["packages"]
+          assert [p["file"] for p in packages] == ["apk-repo-hello-0.0.1-r0.apk"], packages
+          assert packages[0]["sha256"] is None and packages[0]["size"] > 0, packages
+          print("Before publishing, no repository; after,", [p["file"] for p in packages])
           EOF
       - id: pull
         uses: ./actions/pull

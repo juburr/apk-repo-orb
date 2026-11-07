@@ -169,6 +169,14 @@ check "U-16: publish_public_key uploads the public key" succeeded
 aws s3api get-object ${ENDPOINT_ARGS[@]+"${ENDPOINT_ARGS[@]}"} --bucket "${BUCKET}" --key "${PREFIX}/test-apk.rsa.pub" "${WORK}/public.pub" > /dev/null 2>&1
 check "byte for byte" cmp -s "${WORK}/public.pub" "${WORK}/keys/test-apk.rsa.pub"
 
+begin "I-1, I-2: inspect"
+run inspect arch="x86_64 aarch64"
+check "inspect succeeds for both architectures" succeeded
+check "listing every package of each index" receipt_is 'sorted((a, p["file"]) for a, x in r["architectures"].items() for p in x["packages"])' \
+    "[('aarch64', 'hello-1.0-r0.apk'), ('x86_64', 'hello-1.0-r0.apk'), ('x86_64', 'world-2.0-r0.apk')]"
+check "with their sizes and no SHA-256" receipt_is 'all(p["size"] > 0 and p["sha256"] is None for x in r["architectures"].values() for p in x["packages"])' "True"
+check "and the index's ETag" receipt_is 'r["architectures"]["x86_64"]["index"]["etag"].strip("\"") == "'"${before//\"/}"'"' "True"
+
 begin "T-4: pull and verify"
 run pull arch="x86_64 aarch64" out_dir=pulled
 check "pull succeeds for both architectures" succeeded
@@ -208,6 +216,8 @@ if [[ -n "${first_version}" ]]; then
     check "recording that version" receipt_is 'r["architectures"]["x86_64"]["index"]["version_id"]' "${first_version}"
     run verify arch=x86_64 dir=snapshot index_sha256="${first_sha256}"
     check "verify accepts the snapshot with the same pin" succeeded
+    run inspect arch=x86_64 bucket="${VERSIONED_BUCKET}" index_sha256="${first_sha256}" index_version_id="${first_version}"
+    check "I-5: inspect reads the replaced index by its version too" receipt_is '[p["file"] for p in r["architectures"]["x86_64"]["packages"]]' "['hello-1.0-r0.apk']"
     run pull arch=x86_64 out_dir=mixed bucket="${VERSIONED_BUCKET}" index_sha256="${first_sha256}" \
         index_version_id="${current_version}"
     check "another version than the pinned index's fails" failed
@@ -229,6 +239,10 @@ check "creating no index" [ "$(s3_etag "${PREFIX}/x86_64/APKINDEX.tar.gz")" == a
 run pull arch=x86_64 out_dir=pulled
 check "pulling from it fails" failed
 check "P-4, E-3: saying there is no repository there (a 404, not a 403)" said "There is no repository at"
+run inspect arch=x86_64
+check "I-3: so does inspecting it" failed
+run inspect arch=x86_64 allow_missing=true
+check "I-3: unless allow_missing reports it as empty" receipt_is 'r["architectures"]["x86_64"]' "{'index': None, 'packages': []}"
 run publish allow_create=true s3_checksums=false
 check "s3_checksums=false: publishing without SHA-256 checksum headers succeeds" succeeded
 

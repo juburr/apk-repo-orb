@@ -55,10 +55,9 @@ ar_need_tools python3 openssl
 ARCH=$(ar_default_arch "${ARCH}") || exit $?
 ar_arches "${ARCH}"
 ar_check_receipt_path "${RECEIPT_PATH}"
-declare -A PIN_SHA256=()
-for arch in "${AR_ARCHES[@]}"; do
-    PIN_SHA256[${arch}]=$(ar_index_sha256 index_sha256 "${INDEX_SHA256}" "${arch}") || exit $?
-done
+# shellcheck disable=SC2034 # filled and read by the lib
+declare -A AR_PIN_SHA256=() AR_PIN_VERSION_ID=()
+ar_index_pins "${INDEX_SHA256}" ""
 # shellcheck disable=SC2034 # filled and read by the lib
 declare -A AR_KEYS=()
 ar_keyring "${KEYRING}"
@@ -74,12 +73,12 @@ for arch in "${AR_ARCHES[@]}"; do
     if [[ ! -f "${index}" ]]; then
         ar_die "${index} is missing; ${DIR} has no ${arch} repository."
     fi
-    ar_check_pinned_index "${index}" "${PIN_SHA256[${arch}]}" "${index}" \
+    ar_check_pinned_index "${index}" "${AR_PIN_SHA256[${arch}]}" "${index}" \
         "This isn't the index pinned; it may have been replaced, or pulled without the pin."
     ar_verify_index "${index}" "${arch}" "${AR_WORK}/${arch}"
     ar_verify_packages "${DIR}/${arch}" "${arch}" "${AR_WORK}/${arch}" "${AR_WORK}/receipt/arch/${arch}"
     printf '%s\t%s\n' key "${index}" sha256 "$(ar_sha256 "${index}")" signature ".SIGN.RSA256.${AR_INDEX_KEY}.pub" \
-        pinned "$([[ -n "${PIN_SHA256[${arch}]}" ]] && echo true || echo false)" > "${AR_WORK}/receipt/arch/${arch}/index.tsv"
+        pinned "$([[ -n "${AR_PIN_SHA256[${arch}]}" ]] && echo true || echo false)" > "${AR_WORK}/receipt/arch/${arch}/index.tsv"
     count=$(wc -l < "${AR_WORK}/${arch}/entries.tsv")
     echo "Verified ${DIR}/${arch}: an index signed with ${AR_INDEX_KEY} and its ${count// /} package(s)."
 done

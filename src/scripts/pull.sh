@@ -84,15 +84,9 @@ fi
 # A pinned read: the index's bytes (a SHA-256 from an earlier receipt) and,
 # in a versioned bucket, which version of it to read, so a pull can fetch
 # that snapshot again. Packages are immutable, so the index fixes them too.
-declare -A PIN_SHA256=() PIN_VERSION_ID=()
-for arch in "${AR_ARCHES[@]}"; do
-    PIN_SHA256[${arch}]=$(ar_index_sha256 index_sha256 "${INDEX_SHA256}" "${arch}") || exit $?
-    PIN_VERSION_ID[${arch}]=$(ar_index_version_id index_version_id "${INDEX_VERSION_ID}" "${arch}") || exit $?
-    if [[ -n "${PIN_VERSION_ID[${arch}]}" && -z "${PIN_SHA256[${arch}]}" ]]; then
-        ar_usage "index_version_id needs index_sha256: the version says where to find the index, its SHA-256 which one to trust." \
-            "Give both from the same receipt (index.sha256 and index.version_id)."
-    fi
-done
+# shellcheck disable=SC2034 # filled and read by the lib
+declare -A AR_PIN_SHA256=() AR_PIN_VERSION_ID=()
+ar_index_pins "${INDEX_SHA256}" "${INDEX_VERSION_ID}"
 ar_need_tools python3 openssl
 ar_need_aws
 # shellcheck disable=SC2034 # filled and read by the lib
@@ -119,46 +113,9 @@ for arch in "${AR_ARCHES[@]}"; do
     stage="${AR_WORK}/stage/${arch}"
     mkdir -p "${stage}"
     key="${PREFIX}/${arch}/APKINDEX.tar.gz"
-    pinned_sha256=${PIN_SHA256[${arch}]}
-    pinned_version=${PIN_VERSION_ID[${arch}]}
-    status=0
-    ar_get_object "${key}" "${stage}/APKINDEX.tar.gz" "${pinned_version}" || status=$?
-    case "${status}" in
-        0) ;;
-        "${AR_ABSENT}")
-            if [[ -n "${pinned_version}" ]]; then
-                ar_die "$(ar_s3_url "${key}") has no version ${pinned_version} (index_version_id)." \
-                    "Check that it comes from a receipt for this bucket, prefix and arch, and that the version wasn't deleted or expired."
-            fi
-            ar_die "There is no repository at $(ar_s3_url "${PREFIX}/${arch}"): ${key} doesn't exist." \
-                "Check bucket, prefix and arch, or publish to it first." ;;
-        "${AR_DENIED}")
-            if [[ -n "${pinned_version}" ]]; then
-                ar_die "Access to version ${pinned_version} of $(ar_s3_url "${key}") was denied. It may not exist." \
-                    "Reading a version needs s3:GetObjectVersion on $(ar_s3_url "${PREFIX}")/* as well as s3:GetObject (README: Bucket Setup)."
-            fi
-            ar_die "Access to $(ar_s3_url "${key}") was denied. It may not exist." "$(ar_denied_hint "${key}")" ;;
-    esac
-    etag=${AR_ETAG}
-    version_id=${AR_VERSION_ID}
-    echo "Read $(ar_s3_url "${key}") (ETag ${etag}${version_id:+, version ${version_id}})."
-    # A service that ignores versionId would answer with the current index.
-    # ar_get_object reports the version "null" as none.
-    expected_version=${pinned_version}
-    [[ "${expected_version}" == "null" ]] && expected_version=""
-    if [[ -n "${pinned_version}" && "${version_id}" != "${expected_version}" ]]; then
-        ar_die "Asked for version ${pinned_version} of $(ar_s3_url "${key}"), the service returned ${version_id:-an unversioned object}." \
-            "The service may not support object versions; pin index_sha256 alone there."
-    fi
-    if [[ -n "${pinned_version}" ]]; then
-        ar_check_pinned_index "${stage}/APKINDEX.tar.gz" "${pinned_sha256}" "$(ar_s3_url "${key}") version ${pinned_version}" \
-            "That version isn't the index pinned: take index_sha256 and index_version_id from the same receipt."
-    else
-        ar_check_pinned_index "${stage}/APKINDEX.tar.gz" "${pinned_sha256}" "$(ar_s3_url "${key}")" \
-            "The index has changed since. To read the pinned one again from a versioned bucket, set index_version_id too" \
-            "(the receipt's index.version_id)."
-    fi
-    ar_verify_index "${stage}/APKINDEX.tar.gz" "${arch}" "${AR_WORK}/${arch}"
+    ar_read_index "${arch}" "${key}" "${stage}/APKINDEX.tar.gz" "${AR_WORK}/${arch}"
+    etag=${AR_INDEX_ETAG}
+    version_id=${AR_INDEX_VERSION_ID}
 
     # Only what the verified index lists: each package's sidecar and its
     # signatures by keyring keys, then the package itself, from the cache
@@ -203,7 +160,7 @@ for arch in "${AR_ARCHES[@]}"; do
     ar_verify_packages "${stage}" "${arch}" "${AR_WORK}/${arch}" "${AR_WORK}/receipt/arch/${arch}"
     printf '%s\t%s\n' key "${key}" sha256 "$(ar_sha256 "${stage}/APKINDEX.tar.gz")" etag "${etag}" \
         version_id "${version_id}" signature ".SIGN.RSA256.${AR_INDEX_KEY}.pub" \
-        pinned "$([[ -n "${pinned_sha256}" ]] && echo true || echo false)" > "${AR_WORK}/receipt/arch/${arch}/index.tsv"
+        pinned "$([[ -n "${AR_PIN_SHA256[${arch}]}" ]] && echo true || echo false)" > "${AR_WORK}/receipt/arch/${arch}/index.tsv"
     echo "Verified ${arch}: an index signed with ${AR_INDEX_KEY}, ${downloaded} package(s) downloaded, ${reused} from the cache."
 done
 
