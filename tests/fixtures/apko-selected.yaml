@@ -1,0 +1,17 @@
+# The end-to-end test's image from a selective pull (T-6): ./selected holds
+# the whole signed index, which lists apk-repo-hello 0.0.1 and 0.0.2, and
+# only the 0.0.1 package, so apko must be pinned to exactly that version.
+contents:
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    - ./keyring/apk-repo-test.rsa.pub
+  repositories:
+    - https://packages.wolfi.dev/os
+    - '@local ./selected'
+  packages:
+    - wolfi-baselayout
+    - busybox
+    - apk-repo-hello=0.0.1-r0@local
+
+entrypoint:
+  command: /usr/bin/apk-repo-hello

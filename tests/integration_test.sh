@@ -81,6 +81,14 @@ receipt_value() {
     python3 -I -c 'import json, sys; r = json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "${CASE}/receipt.json" "$1"
 }
 
+# multipart_etag KEY PARTS: KEY's ETag is a multipart upload's of PARTS parts
+# ("<hex>-PARTS"), as S3 and versitygw give it.
+multipart_etag() {
+    local etag
+    etag=$(s3_etag "$1")
+    [[ "${etag}" == *"-$2\"" ]] || { OUTPUT+=$'\n'"$1's ETag is ${etag}"; return 1; }
+}
+
 # s3_etag KEY: the object's ETag, or "absent".
 s3_etag() {
     aws s3api get-object ${ENDPOINT_ARGS[@]+"${ENDPOINT_ARGS[@]}"} --bucket "${BUCKET}" --key "$1" \
@@ -284,6 +292,30 @@ else
     check "the bucket refuses to replace the package with AccessDenied (a bucket policy)" said "AccessDenied"
     check "and the package is unchanged" [ "$(s3_etag "${key}")" == "${etag}" ]
 fi
+
+begin "U-17, F-17: a package uploaded in parts"
+new_case multipart
+mkdir -p "${CASE}/packages/x86_64"
+# About 12 MiB of random bytes: three parts at the smallest part size.
+${FIXTURES} build "${CASE}/packages/x86_64/big-1.0-r0.apk" big 1.0-r0 x86_64 --key "${WORK}/keys/build.rsa" \
+    --random "usr/share/big/blob=$((12 * 1024 * 1024))"
+run publish allow_create=true multipart_threshold=5MB multipart_chunksize=5MB
+check "publishing it in parts succeeds" succeeded
+check "F-17: after proving CompleteMultipartUpload enforces If-None-Match" said "enforces If-None-Match on CompleteMultipartUpload too"
+check "in three parts" said "big-1.0-r0.apk in 3 part(s) of up to 5 MiB."
+check "U-17: its ETag is a multipart upload's, of three parts" multipart_etag "${PREFIX}/x86_64/big-1.0-r0.apk" 3
+run pull arch=x86_64 out_dir=pulled
+check "pull reads it back and verifies it" succeeded
+run verify arch=x86_64 dir=pulled
+check "and so does verify" succeeded
+check "byte for byte as published" receipt_is 'r["architectures"]["x86_64"]["packages"][0]["size"] > 12 * 1024 * 1024' "True"
+rm -rf "${CASE}/packages"
+mkdir -p "${CASE}/packages/x86_64"
+${FIXTURES} build "${CASE}/packages/x86_64/big-1.0-r0.apk" big 1.0-r0 x86_64 --key "${WORK}/keys/build.rsa" \
+    --random "usr/share/big/blob=$((12 * 1024 * 1024))"
+run publish multipart_threshold=5MB multipart_chunksize=5MB
+check "U-6: another build of it fails" failed
+check "saying packages are immutable" said "packages are immutable"
 
 begin "T-5: concurrent publishes (${ROUNDS} rounds)"
 new_case race

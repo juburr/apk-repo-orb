@@ -14,8 +14,11 @@
 #   - the Python helper parses as Python 3.8, the oldest it supports;
 #   - T-8: no script, workflow or action outside the test fixtures runs a
 #     high-level `aws s3` command, deletes anything, or writes with
-#     put-object without --if-match or --if-none-match (U-12), and the
-#     orb's own code calls no s3api operation but get-object and put-object;
+#     put-object or complete-multipart-upload without --if-match or
+#     --if-none-match (U-12), and the orb's own code calls no s3api
+#     operation but get-object, put-object and the multipart upload's
+#     (create-multipart-upload, upload-part, complete-multipart-upload and
+#     abort-multipart-upload, which removes parts, never an object);
 #   - tests/run_command.sh runs each command's own script;
 #   - the version receipts report (AR_TOOL_VERSION) is the one the
 #     examples and the README pin, so a release can't ship with another.
@@ -160,10 +163,13 @@ t8_problems() {
             if (text ~ /put-object/ && text !~ /--if-match|--if-none-match|--generate-cli-skeleton/) {
                 print file ":" line ": put-object without --if-match or --if-none-match"
             }
+            if (text ~ /complete-multipart-upload/ && text !~ /--if-match|--if-none-match|--generate-cli-skeleton/) {
+                print file ":" line ": complete-multipart-upload without --if-match or --if-none-match"
+            }
             if (orb_code == 1) {
                 op = text
                 while (match(op, /s3api [a-z0-9-]+/)) {
-                    if (substr(op, RSTART + 6, RLENGTH - 6) !~ /^(get-object|put-object)$/) {
+                    if (substr(op, RSTART + 6, RLENGTH - 6) !~ /^(get-object|put-object|create-multipart-upload|upload-part|complete-multipart-upload|abort-multipart-upload)$/) {
                         print file ":" line ": s3api " substr(op, RSTART + 6, RLENGTH - 6)
                     }
                     op = substr(op, RSTART + RLENGTH)
@@ -194,13 +200,19 @@ aws s3api put-object --bucket b \
     --key k --body f
 aws s3api put-object --bucket b --key k --body f --if-none-match "*"
 aws s3api list-objects-v2 --bucket b
+aws s3api complete-multipart-upload --bucket b --key k \
+    --upload-id u --multipart-upload file://p
+aws s3api complete-multipart-upload --bucket b --key k --upload-id u --multipart-upload file://p --if-none-match "*"
+aws s3api upload-part-copy --bucket b
 EOF
 expected="${SAMPLE}:2: a high-level aws s3 command
 ${SAMPLE}:3: delete-object(s)
 ${SAMPLE}:3: --delete
 ${SAMPLE}:3: s3api delete-objects
 ${SAMPLE}:4: put-object without --if-match or --if-none-match
-${SAMPLE}:7: s3api list-objects-v2"
+${SAMPLE}:7: s3api list-objects-v2
+${SAMPLE}:8: complete-multipart-upload without --if-match or --if-none-match
+${SAMPLE}:11: s3api upload-part-copy"
 if [[ "$(t8_problems 1 "${SAMPLE}")" != "${expected}" ]]; then
     fail "T-8's check doesn't find what it must in a sample:"$'\n'"$(t8_problems 1 "${SAMPLE}")"
 fi
@@ -215,6 +227,9 @@ while IFS= read -r problem; do
 done < <(t8_problems 1 "${orb_files[@]}"; [[ "${#ci_files[@]}" -eq 0 ]] || t8_problems 0 "${ci_files[@]}")
 if ! grep -q 'put-object .*--if-none-match' src/scripts/lib/apk_repo.sh || ! grep -q 'put-object .*--if-match' src/scripts/lib/apk_repo.sh; then
     fail "T-8: lib/apk_repo.sh no longer writes with put-object --if-none-match and --if-match"
+fi
+if ! grep -q 'complete-multipart-upload .*--if-none-match "\*"' src/scripts/lib/apk_repo.sh; then
+    fail "T-8: lib/apk_repo.sh no longer completes multipart uploads with --if-none-match \"*\""
 fi
 
 # tests/run_command.sh, which test-deploy.yml runs the steps that must fail

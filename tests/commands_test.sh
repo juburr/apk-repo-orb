@@ -532,10 +532,11 @@ check "U-3: a package for another arch fails" failed
 check "naming both" said "is built for aarch64, but it is in packages/x86_64"
 new_case
 mkdir -p "${CASE}/packages/x86_64"
-truncate -s 5368709121 "${CASE}/packages/x86_64/huge-1.0-r0.apk"
+# Sparse: S3's largest object plus one byte, refused before it is copied.
+truncate -s $((5 * 1024 * 1024 * 1024 * 1024 + 1)) "${CASE}/packages/x86_64/huge-1.0-r0.apk"
 publish_new
-check "U-14: a package over 5 GiB fails" failed
-check "before any upload" said "exceeds 5 GiB; multipart upload is not supported yet"
+check "U-14: a package over 5 TiB, S3's largest object, fails" failed
+check "before it is staged" said "is larger than 5 TiB, the largest object S3 stores."
 
 begin "F-2, F-3: parameters"
 new_case
@@ -573,6 +574,113 @@ new_case
 package x86_64 hello 1.0.0-r0
 publish_new PARAM_S3_CHECKSUMS=false
 check "false sends no checksum" json_is "${CASE}/s3/.meta/bucket/test/os/x86_64/hello-1.0.0-r0.apk.json" 'r["ChecksumSHA256"]' "None"
+
+begin "U-17, F-17: multipart uploads"
+# big_package ARCH NAME VERSION [DIR]: a package of about 12 MiB of random
+# bytes, three 5 MiB parts at the smallest part size, signed with the build key.
+big_package() {
+    local dir=${4:-${CASE}/packages}
+    mkdir -p "${dir}/$1"
+    ${FIXTURES} build "${dir}/$1/$2-$3.apk" "$2" "$3" "$1" --key "${WORK}/keys/build.rsa" \
+        --random "usr/share/$2/blob=$((12 * 1024 * 1024))"
+}
+# open_uploads: how many multipart uploads the fake bucket has open.
+open_uploads() { find "${CASE}/s3/.uploads" -mindepth 1 -maxdepth 1 2> /dev/null | wc -l; }
+MULTIPART=(PARAM_MULTIPART_THRESHOLD=5MB PARAM_MULTIPART_CHUNKSIZE=5MB)
+new_case
+big_package x86_64 big 1.0-r0
+package x86_64 small 1.0-r0
+publish_new "${MULTIPART[@]}"
+check "a package of multipart_threshold or more is published" succeeded
+check "F-17: after proving CompleteMultipartUpload enforces If-None-Match" said "enforces If-None-Match on CompleteMultipartUpload too"
+check "on the probe object, which the probe's multipart upload must not replace" logged '^CompleteMultipartUpload test/os/\.apk-repo-orb/probe if-none-match '
+check "U-17: in parts of multipart_chunksize" said "Uploading s3://bucket/test/os/x86_64/big-1.0-r0.apk in 3 part(s) of up to 5 MiB."
+check "completed with If-None-Match" logged '^CompleteMultipartUpload test/os/x86_64/big-1\.0-r0\.apk if-none-match '
+check "while a smaller package still goes up with PutObject" logged '^PutObject test/os/x86_64/small-1\.0-r0\.apk if-none-match '
+check "and is never uploaded in parts" not_logged '^(CreateMultipartUpload|UploadPart) test/os/x86_64/small'
+check "leaving no multipart upload open" [ "$(open_uploads)" -eq 0 ]
+check "with the package's bytes, as re-signed" json_is "${CASE}/apk-repo-receipt.json" \
+    '[p["sha256"] for p in r["architectures"]["x86_64"]["packages"] if p["file"] == "big-1.0-r0.apk"] == [open("s3/bucket/test/os/x86_64/big-1.0-r0.apk.sha256").read()[:64]]' "True"
+run pull PARAM_OUT_DIR=pulled
+check "pull reads it back and verifies it" succeeded
+run verify PARAM_DIR=pulled
+check "and so does verify" succeeded
+: > "${CASE}/aws.log"
+run publish "${MULTIPART[@]}"
+check "publishing the same build again succeeds" succeeded
+check "skipping it as identical, without uploading anything" not_logged '^(PutObject|CreateMultipartUpload|UploadPart|CompleteMultipartUpload) test/os/x86_64/'
+rm -rf "${CASE}/packages"
+big_package x86_64 big 1.0-r0
+run publish "${MULTIPART[@]}"
+check "U-6: a different build of a version published in parts fails" failed
+check "saying packages are immutable" said "packages are immutable"
+
+new_case
+big_package x86_64 big 1.0-r0
+publish_new
+check "U-17: with the default multipart_threshold (5GB), a 12 MiB package goes up with PutObject" logged '^PutObject test/os/x86_64/big-1\.0-r0\.apk if-none-match '
+check "and nothing is uploaded in parts, not even the probe" not_logged '^(CreateMultipartUpload|UploadPart|CompleteMultipartUpload) '
+
+new_case
+big_package x86_64 big 1.0-r0
+FAKE_AWS_IGNORE_MULTIPART_CONDITIONS=1 publish_new "${MULTIPART[@]}"
+check "F-17: a backend that ignores If-None-Match on CompleteMultipartUpload is refused" failed
+check "saying so" said "does not enforce If-None-Match on CompleteMultipartUpload; refusing to publish packages of multipart_threshold or more."
+check "before the package is uploaded" absent "$(s3 test/os/x86_64/big-1.0-r0.apk)"
+check "with the probe object's bytes unchanged" file_has "$(s3 test/os/.apk-repo-orb/probe)" "apk-repo-orb conditional write probe v1"
+
+new_case
+big_package x86_64 big 1.0-r0
+FAKE_AWS_NO_MULTIPART_CONDITIONS=1 publish_new "${MULTIPART[@]}"
+check "an AWS CLI whose complete-multipart-upload can't take --if-none-match is refused" failed
+check "saying so" said "can't complete a multipart upload conditionally"
+check "before any write" not_logged '^(PutObject|CreateMultipartUpload) '
+
+new_case
+big_package x86_64 big 1.0-r0
+echo 'UploadPart big-1\.0-r0\.apk$ 500 1' > "${CASE}/rules"
+publish_new "${MULTIPART[@]}"
+check "a part that fails to upload fails the publish" failed
+check "naming the part" said "Couldn't upload part"
+check "aborting the upload" logged '^AbortMultipartUpload test/os/x86_64/big-1\.0-r0\.apk '
+check "leaving none open" [ "$(open_uploads)" -eq 0 ]
+check "and no index" absent "$(s3 test/os/x86_64/APKINDEX.tar.gz)"
+echo 'CompleteMultipartUpload big-1\.0-r0\.apk$ 409 1' > "${CASE}/rules"
+: > "${CASE}/aws.log"
+publish_new "${MULTIPART[@]}"
+check "U-10: a 409 on CompleteMultipartUpload is retried" succeeded
+check "with a new upload, the first one aborted" [ "$(grep -c '^CreateMultipartUpload test/os/x86_64/big' "${CASE}/aws.log")" -eq 2 ] && logged '^AbortMultipartUpload test/os/x86_64/big' && [ "$(open_uploads)" -eq 0 ]
+
+new_case
+big_package x86_64 big 1.0-r0
+echo 'CreateMultipartUpload big-1\.0-r0\.apk$ 403' > "${CASE}/rules"
+publish_new "${MULTIPART[@]}"
+check "E-3: a denied multipart upload fails" failed
+check "naming s3:AbortMultipartUpload" said "s3:AbortMultipartUpload"
+: > "${CASE}/rules"
+publish_new "${MULTIPART[@]}" PARAM_S3_CHECKSUMS=false
+check "F-9: with s3_checksums=false, a multipart upload succeeds too" succeeded
+
+new_case
+big_package x86_64 big 1.0-r0
+publish_new "${MULTIPART[@]}" PARAM_DRY_RUN=true
+check "U-13: a dry run with a package of multipart_threshold or more writes nothing" succeeded
+check "not even the multipart probe" not_logged '^(PutObject|CreateMultipartUpload|UploadPart|CompleteMultipartUpload) '
+
+new_case
+big_package x86_64 big 1.0-r0
+# Unusual sizes that are still allowed: a threshold in bytes, and parts of
+# 7 MiB, so the 12 MiB package goes up in two.
+publish_new PARAM_MULTIPART_THRESHOLD=5242880 PARAM_MULTIPART_CHUNKSIZE=7MB
+check "sizes in bytes, and other part sizes, work" said "in 2 part(s) of up to 7 MiB."
+: > "${CASE}/aws.log"
+for bad in PARAM_MULTIPART_THRESHOLD=4MB PARAM_MULTIPART_THRESHOLD=6GB PARAM_MULTIPART_THRESHOLD=5.5MB \
+    PARAM_MULTIPART_THRESHOLD=five PARAM_MULTIPART_CHUNKSIZE=4MB PARAM_MULTIPART_CHUNKSIZE=6GB \
+    PARAM_MULTIPART_CHUNKSIZE=5242881 PARAM_MULTIPART_CHUNKSIZE=-64MB; do
+    publish_new "${bad}"
+    check "a usage error (2): ${bad#PARAM_}" exited 2
+done
+check "before any AWS call" not_logged '.'
 
 # ------------------------------------------------------------------ pull
 echo "=== pull"

@@ -5,7 +5,8 @@
 # If-Match on PutObject atomically per key. It listens on 127.0.0.1:7070.
 # Then it creates BUCKET and, before any test relies on it, proves that the
 # server answers 412 to a write with If-None-Match: * on an existing key
-# (F-14) and with If-Match on another ETag (F-15).
+# (F-14), with If-Match on another ETag (F-15), and to a multipart upload
+# completed with If-None-Match: * on an existing key (F-17).
 #
 # With VERSIONED_BUCKET, it also creates that bucket with versioning turned
 # on (versitygw keeps old versions in /tmp/vgw-versions), and proves that an
@@ -121,6 +122,15 @@ if ! cmp -s "${WORK}/read" "${WORK}/second"; then
     exit 1
 fi
 echo "ok: If-Match with the current ETag replaces the object."
+upload=$(aws s3api create-multipart-upload --endpoint-url "${ENDPOINT}" --bucket "${BUCKET}" --key "${KEY}" \
+    --query UploadId --output text)
+part_etag=$(aws s3api upload-part --endpoint-url "${ENDPOINT}" --bucket "${BUCKET}" --key "${KEY}" \
+    --upload-id "${upload}" --part-number 1 --body "${WORK}/first" --query ETag --output text)
+printf '{"Parts": [{"PartNumber": 1, "ETag": "%s"}]}\n' "${part_etag//\"/\\\"}" > "${WORK}/parts.json"
+expect_412 "F-17: CompleteMultipartUpload with If-None-Match: * on an existing key" \
+    aws s3api complete-multipart-upload --endpoint-url "${ENDPOINT}" --bucket "${BUCKET}" --key "${KEY}" \
+    --upload-id "${upload}" --multipart-upload "file://${WORK}/parts.json" --if-none-match "*"
+aws s3api abort-multipart-upload --endpoint-url "${ENDPOINT}" --bucket "${BUCKET}" --key "${KEY}" --upload-id "${upload}"
 
 if [[ -n "${VERSIONED_BUCKET}" ]]; then
     aws s3api create-bucket --endpoint-url "${ENDPOINT}" --bucket "${VERSIONED_BUCKET}" > /dev/null

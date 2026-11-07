@@ -1,0 +1,18 @@
+# The same image as apko-selected.yaml without the version pin, which the
+# end-to-end test (T-6) expects apko to refuse to build: it picks the newest
+# listed version, 0.0.2, which the selective pull didn't fetch. This is why
+# the README says to pin apko to the versions a selective pull fetched.
+contents:
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    - ./keyring/apk-repo-test.rsa.pub
+  repositories:
+    - https://packages.wolfi.dev/os
+    - '@local ./selected'
+  packages:
+    - wolfi-baselayout
+    - busybox
+    - apk-repo-hello@local
+
+entrypoint:
+  command: /usr/bin/apk-repo-hello

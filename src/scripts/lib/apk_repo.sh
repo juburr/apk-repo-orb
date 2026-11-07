@@ -32,8 +32,16 @@ AR_CONFLICT=6
 # The oldest AWS CLI v2 whose s3api put-object takes --if-match; 2.17.34
 # added --if-none-match.
 AR_AWS_MIN_VERSION="2.22.5"
-# How many downloads ar_get_objects runs at once.
+# How many downloads ar_get_objects runs at once, and how many parts
+# ar_put_multipart uploads at once.
 AR_PARALLEL=8
+# S3's multipart limits: a part (all but the last) from 5 MiB to 5 GiB, at
+# most 10,000 parts, and an object of at most 5 TiB. A single PutObject
+# takes at most 5 GiB.
+AR_MIN_PART=$((5 * 1024 * 1024))
+AR_MAX_PART=$((5 * 1024 * 1024 * 1024))
+AR_MAX_PARTS=10000
+AR_MAX_OBJECT=$((5 * 1024 * 1024 * 1024 * 1024))
 # Signatures ar_verify_sidecar has warned about, so each is reported once.
 declare -A AR_SIG_WARNED=()
 
@@ -837,6 +845,173 @@ ar_put_object() {
     esac
     cat "${err}" >&2
     ar_die "Couldn't write $(ar_s3_url "${key}"): the AWS CLI's PutObject exited ${status}, with the message above."
+}
+
+# ar_size NAME VALUE: prints VALUE, the parameter NAME's size, in bytes: a
+# number with an optional KB, MB, GB or TB suffix, counted in 1024s as the
+# AWS CLI's multipart_threshold and multipart_chunksize are. Run it as
+# X=$(ar_size ...) || exit $?, like ar_default_arch.
+ar_size() {
+    local number unit
+    if ! ar_match "$2" '^[0-9]{1,13}(KB|MB|GB|TB)?$'; then
+        ar_usage "$1 must be a size such as 64MB or 5GB (KB, MB, GB and TB count in 1024s), not '$2'."
+    fi
+    number=${2%%[KMGT]B}
+    unit=${2#"${number}"}
+    number=$((10#${number}))
+    case "${unit}" in
+        KB) number=$((number * 1024)) ;;
+        MB) number=$((number * 1024 * 1024)) ;;
+        GB) number=$((number * 1024 * 1024 * 1024)) ;;
+        TB) number=$((number * 1024 * 1024 * 1024 * 1024)) ;;
+    esac
+    printf '%s\n' "${number}"
+}
+
+# ar_need_aws_multipart: the AWS CLI's complete-multipart-upload must take
+# --if-none-match, as its skeleton shows, before a multipart upload starts.
+ar_need_aws_multipart() {
+    local skeleton version
+    skeleton=$(aws s3api complete-multipart-upload --generate-cli-skeleton 2> /dev/null) || true
+    if [[ "${skeleton}" != *'"IfNoneMatch"'* ]]; then
+        version=$(aws --version 2>&1 | awk 'NR == 1') || true
+        ar_die "The AWS CLI on the PATH (${version:-version unknown}) can't complete a multipart upload conditionally (complete-multipart-upload --if-none-match)." \
+            "Install a newer AWS CLI v2 in an earlier step."
+    fi
+}
+
+# ar_put_multipart KEY FILE CONTENT_TYPE CACHE_CONTROL CHUNKSIZE: uploads
+# FILE to KEY as a multipart upload completed with If-None-Match: *, so it
+# is only ever created, never replaced: ar_put_multipart is for immutable
+# objects alone, and every complete-multipart-upload names its condition
+# literally, as tests/wiring_test.sh checks. Parts are CHUNKSIZE bytes (a
+# multiple of 1 MiB), or larger if FILE would need more than 10,000;
+# AR_PARALLEL of them upload at once, each from a temporary file of its own,
+# with its SHA-256 when AR_S3_CHECKSUMS is true. Any failure aborts the
+# upload. Returns as ar_put_object does: 0 (setting AR_ETAG and
+# AR_VERSION_ID), AR_PRECONDITION, AR_CONFLICT or AR_DENIED; any other error
+# is fatal.
+ar_put_multipart() {
+    local key=$1 file=$2 chunk=$5 size parts upload err status result kind part dir etag checksum entry
+    local -a algorithm=()
+    size=$(stat -L -c %s -- "${file}")
+    if (( (size + chunk - 1) / chunk > AR_MAX_PARTS )); then
+        chunk=$(( ((size + AR_MAX_PARTS - 1) / AR_MAX_PARTS + 1048575) / 1048576 * 1048576 ))
+    fi
+    parts=$(( size == 0 ? 1 : (size + chunk - 1) / chunk ))
+    if [[ "${AR_S3_CHECKSUMS:-true}" == "true" ]]; then
+        algorithm=(--checksum-algorithm SHA256)
+    fi
+    err=$(mktemp "${AR_WORK}/aws.XXXXXX")
+    status=0
+    upload=$(aws s3api create-multipart-upload ${AR_AWS_OPTIONS[@]+"${AR_AWS_OPTIONS[@]}"} --bucket "${AR_BUCKET}" --key "${key}" \
+        --content-type "$3" --cache-control "$4" ${algorithm[@]+"${algorithm[@]}"} --query UploadId --output text 2> "${err}") || status=$?
+    if [[ "${status}" -ne 0 || -z "${upload}" || "${upload}" == "None" ]]; then
+        if [[ "$(ar_aws_status "${err}")" == "denied" ]]; then
+            rm -f -- "${err}"
+            return "${AR_DENIED}"
+        fi
+        cat "${err}" >&2
+        ar_die "Couldn't start a multipart upload of $(ar_s3_url "${key}"): the AWS CLI's CreateMultipartUpload exited ${status}, with the message above."
+    fi
+    echo "Uploading $(ar_s3_url "${key}") in ${parts} part(s) of up to $((chunk / 1048576)) MiB."
+    dir=$(mktemp -d "${AR_WORK}/multipart.XXXXXX")
+    for ((part = 1; part <= parts; part++)); do
+        ar_upload_part "${key}" "${upload}" "${file}" "${part}" "${chunk}" "${dir}" &
+        if (( part % AR_PARALLEL == 0 )); then
+            wait
+        fi
+    done
+    wait
+    # Every part, in order: {"Parts": [{"PartNumber": N, "ETag": ..., ...}]}.
+    printf '{"Parts": [' > "${dir}/parts.json"
+    for ((part = 1; part <= parts; part++)); do
+        case "$(cat -- "${dir}/${part}.status" 2> /dev/null)" in
+            0) ;;
+            "${AR_DENIED}")
+                ar_abort_multipart "${key}" "${upload}"
+                rm -rf -- "${dir}" "${err}"
+                return "${AR_DENIED}" ;;
+            *)
+                ar_abort_multipart "${key}" "${upload}"
+                ar_die "Couldn't upload part ${part} of $(ar_s3_url "${key}"); the error is above." ;;
+        esac
+        IFS=$'\t' read -r etag checksum < "${dir}/${part}.result"
+        entry="{\"PartNumber\": ${part}, \"ETag\": \"${etag//\"/\\\"}\""
+        if [[ ${#algorithm[@]} -gt 0 ]]; then
+            entry+=", \"ChecksumSHA256\": \"${checksum}\""
+        fi
+        if (( part > 1 )); then
+            entry=", ${entry}"
+        fi
+        printf '%s}' "${entry}" >> "${dir}/parts.json"
+    done
+    printf ']}\n' >> "${dir}/parts.json"
+    status=0
+    result=$(aws s3api complete-multipart-upload ${AR_AWS_OPTIONS[@]+"${AR_AWS_OPTIONS[@]}"} --bucket "${AR_BUCKET}" --key "${key}" --upload-id "${upload}" --multipart-upload "file://${dir}/parts.json" --if-none-match "*" --query '[ETag, VersionId]' --output text 2> "${err}") || status=$?
+    rm -rf -- "${dir}"
+    if [[ "${status}" -eq 0 ]]; then
+        rm -f -- "${err}"
+        AR_ETAG=${result%%$'\t'*}
+        AR_VERSION_ID=${result#*$'\t'}
+        [[ "${AR_VERSION_ID}" == "None" || "${AR_VERSION_ID}" == "null" ]] && AR_VERSION_ID=""
+        return 0
+    fi
+    kind=$(ar_aws_status "${err}")
+    ar_abort_multipart "${key}" "${upload}"
+    case "${kind}" in
+        precondition) rm -f -- "${err}"; return "${AR_PRECONDITION}" ;;
+        conflict) rm -f -- "${err}"; return "${AR_CONFLICT}" ;;
+        denied) rm -f -- "${err}"; return "${AR_DENIED}" ;;
+    esac
+    cat "${err}" >&2
+    ar_die "Couldn't complete the multipart upload of $(ar_s3_url "${key}"): the AWS CLI's CompleteMultipartUpload exited ${status}, with the message above."
+}
+
+# ar_upload_part KEY UPLOAD FILE PART CHUNKSIZE DIR: uploads part PART of
+# FILE (CHUNKSIZE bytes from (PART - 1) * CHUNKSIZE, or what is left), cut
+# into a temporary file of its own and removed after, and writes its ETag
+# and SHA-256 to DIR/PART.result and its status (0, AR_DENIED, or "failed"
+# with the error printed) to DIR/PART.status. ar_put_multipart runs it in
+# the background.
+ar_upload_part() {
+    local key=$1 upload=$2 file=$3 part=$4 chunk=$5 dir=$6 piece status result
+    local -a checksum=()
+    piece="${dir}/${part}.part"
+    if ! dd if="${file}" of="${piece}" bs=1048576 skip=$(( (part - 1) * chunk / 1048576 )) \
+        count=$(( chunk / 1048576 )) status=none 2> "${dir}/${part}.err"; then
+        cat "${dir}/${part}.err" >&2
+        echo failed > "${dir}/${part}.status"
+        return 0
+    fi
+    if [[ "${AR_S3_CHECKSUMS:-true}" == "true" ]]; then
+        checksum=(--checksum-sha256 "$(openssl dgst -sha256 -binary "${piece}" | base64)")
+    fi
+    status=0
+    result=$(aws s3api upload-part ${AR_AWS_OPTIONS[@]+"${AR_AWS_OPTIONS[@]}"} --bucket "${AR_BUCKET}" --key "${key}" \
+        --upload-id "${upload}" --part-number "${part}" --body "${piece}" ${checksum[@]+"${checksum[@]}"} \
+        --query '[ETag, ChecksumSHA256]' --output text 2> "${dir}/${part}.err") || status=$?
+    rm -f -- "${piece}"
+    if [[ "${status}" -eq 0 ]]; then
+        printf '%s\n' "${result}" > "${dir}/${part}.result"
+        echo 0 > "${dir}/${part}.status"
+    elif [[ "$(ar_aws_status "${dir}/${part}.err")" == "denied" ]]; then
+        echo "${AR_DENIED}" > "${dir}/${part}.status"
+    else
+        cat "${dir}/${part}.err" >&2
+        echo failed > "${dir}/${part}.status"
+    fi
+}
+
+# ar_abort_multipart KEY UPLOAD: discards the parts of an upload that won't
+# complete. Abort removes no object; if it fails, a lifecycle rule that
+# aborts incomplete multipart uploads (README: Versioning and lifecycle)
+# removes the parts later.
+ar_abort_multipart() {
+    if ! aws s3api abort-multipart-upload ${AR_AWS_OPTIONS[@]+"${AR_AWS_OPTIONS[@]}"} --bucket "${AR_BUCKET}" --key "$1" \
+        --upload-id "$2" > /dev/null 2>&1; then
+        ar_warn "Couldn't abort the multipart upload $2 of $(ar_s3_url "$1"); a lifecycle rule that aborts incomplete multipart uploads removes its parts."
+    fi
 }
 
 # ar_receipt_meta KEY VALUE...: adds lines to the receipt's meta.tsv.
