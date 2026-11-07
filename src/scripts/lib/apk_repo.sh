@@ -10,7 +10,7 @@
 # instead of exiting: ar_get_object and ar_put_object return 0, or one of
 # the AR_* codes below.
 
-AR_TOOL_VERSION="0.3.0"
+AR_TOOL_VERSION="0.2.0"
 
 # The same patterns as apk_repo.py; tests/wiring_test.sh checks that.
 AR_NAME_RE='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
@@ -557,7 +557,13 @@ ar_verify_sidecar() {
 # entries in WORKDIR/entries.tsv, writing RECEIPT_DIR/packages.tsv.
 ar_verify_packages() {
     local dir=$1 work=$3 out=$4 name version arch size checksum file actual entry field value package_checksum
-    local -A referenced=([APKINDEX.tar.gz]=1)
+    local -A referenced=([APKINDEX.tar.gz]=1) unselected=()
+    # With packages (ar_select_entries), the index lists more than is checked.
+    if [[ -f "${work}/entries-all.tsv" ]]; then
+        while IFS=$'\t' read -r name version _; do
+            unselected[${name}-${version}.apk]=1
+        done < "${work}/entries-all.tsv"
+    fi
     mkdir -p "${out}" "${AR_WORK}/package"
     : > "${out}/packages.tsv"
     while IFS=$'\t' read -r name version arch size checksum _; do
@@ -599,8 +605,78 @@ ar_verify_packages() {
         if [[ "${file}" == *.apk.sha256.*.sig && -n "${referenced[${file%.sha256.*.sig}.sha256]:-}" ]]; then
             continue
         fi
+        if [[ -n "${unselected[${file}]:-}" ]]; then
+            ar_warn "${dir}/${file} is in the index but not in packages, so it wasn't verified."
+            continue
+        fi
+        if [[ -n "${unselected[${file%.sha256}]:-}" || -n "${unselected[${file%.sha256.*.sig}]:-}" ]]; then
+            continue
+        fi
         ar_warn "${dir}/${file} is not part of the index."
     done
+}
+
+# ar_selection VALUE: sets AR_SELECTION to the <name>=<version> entries of the
+# packages parameter, space- or newline-separated, each checked against the
+# name and version patterns, without repeats. Empty selects everything.
+ar_selection() {
+    local token name version
+    local -a tokens=()
+    local -A seen=()
+    AR_SELECTION=()
+    read -r -d '' -a tokens <<< "$1" || true
+    for token in ${tokens[@]+"${tokens[@]}"}; do
+        name=${token%%=*}
+        version=${token#*=}
+        if [[ "${token}" != *=* ]]; then
+            ar_usage "packages entry '${token}' must be <name>=<version>, such as my-package=1.2.3-r0."
+        fi
+        if ! ar_match "${name}" "${AR_NAME_RE}"; then
+            ar_usage "packages entry '${token}': '${name}' isn't a package name (letters, digits, '.', '_', '+' and '-')."
+        fi
+        if ! ar_match "${version}" "${AR_VERSION_RE}"; then
+            ar_usage "packages entry '${token}': '${version}' isn't a package version with its release, such as 1.2.3-r0."
+        fi
+        if [[ -n "${seen[${token}]:-}" ]]; then
+            ar_usage "packages lists ${token} more than once."
+        fi
+        seen[${token}]=1
+        AR_SELECTION+=("${token}")
+    done
+}
+
+# ar_select_entries WORKDIR WHAT: with a selection (AR_SELECTION), keeps
+# only the selected entries of the verified index's WORKDIR/entries.tsv, in
+# the index's order, moving the full list to entries-all.tsv. Every
+# selected version must be listed; WHAT names the index for the error.
+ar_select_entries() {
+    local work=$1 what=$2 name version line token count=0
+    local -a missing=()
+    local -A listed=() selected=()
+    [[ ${#AR_SELECTION[@]} -eq 0 ]] && return 0
+    mv -- "${work}/entries.tsv" "${work}/entries-all.tsv"
+    while IFS=$'\t' read -r name version _; do
+        listed[${name}=${version}]=1
+        count=$((count + 1))
+    done < "${work}/entries-all.tsv"
+    for token in "${AR_SELECTION[@]}"; do
+        selected[${token}]=1
+        if [[ -z "${listed[${token}]:-}" ]]; then
+            missing+=("${token}")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        ar_die "${what} doesn't list ${missing[*]}, which packages selects." \
+            "packages may only name versions the index lists; inspect reports which those are."
+    fi
+    : > "${work}/entries.tsv"
+    while IFS= read -r line; do
+        IFS=$'\t' read -r name version _ <<< "${line}"
+        if [[ -n "${selected[${name}=${version}]:-}" ]]; then
+            printf '%s\n' "${line}" >> "${work}/entries.tsv"
+        fi
+    done < "${work}/entries-all.tsv"
+    echo "Selected ${#AR_SELECTION[@]} of the ${count} package(s) ${what} lists."
 }
 
 # ---------------------------------------------------------------- S3 calls

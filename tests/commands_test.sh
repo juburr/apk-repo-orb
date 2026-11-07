@@ -751,6 +751,82 @@ run pull PARAM_OUT_DIR=unversioned PARAM_INDEX_SHA256="${pinned%% *}" PARAM_INDE
 check "another version in an unversioned bucket fails (1)" exited 1
 check "with the service's message" said "Invalid version id specified"
 
+begin "P-10: selective pulls (packages)"
+new_case
+package x86_64 hello 1.0.0-r0
+package x86_64 hello 1.1.0-r0
+package x86_64 world 2.1-r3
+package aarch64 hello 1.0.0-r0
+package aarch64 world 2.1-r3
+publish_new PARAM_ARCH="x86_64 aarch64"
+: > "${CASE}/aws.log"
+run pull PARAM_OUT_DIR=some PARAM_PACKAGES="hello=1.0.0-r0 world=2.1-r3"
+check "succeeds" succeeded
+check "saying how many it selected" said "Selected 2 of the 3 package(s) s3://bucket/test/os/x86_64/APKINDEX.tar.gz lists."
+check "pulling the selected packages" exists "${CASE}/some/x86_64/hello-1.0.0-r0.apk" && exists "${CASE}/some/x86_64/world-2.1-r3.apk"
+check "and not the others" absent "${CASE}/some/x86_64/hello-1.1.0-r0.apk"
+check "nor their sidecars" absent "${CASE}/some/x86_64/hello-1.1.0-r0.apk.sha256"
+check "with the whole signed index, as it is" cmp -s "${CASE}/some/x86_64/APKINDEX.tar.gz" "$(s3 test/os/x86_64/APKINDEX.tar.gz)"
+check "never reading another package or its sidecar" not_logged 'hello-1\.1\.0-r0'
+check "the receipt lists only what was pulled" json_is "${CASE}/apk-repo-receipt.json" '[p["file"] for p in r["architectures"]["x86_64"]["packages"]]' "['hello-1.0.0-r0.apk', 'world-2.1-r3.apk']"
+check "and records the selection" json_is "${CASE}/apk-repo-receipt.json" 'r["architectures"]["x86_64"]["selection"]' "['hello=1.0.0-r0', 'world=2.1-r3']"
+run verify PARAM_DIR=some
+check "V-9: verify without packages refuses a selective pull's directory" exited 1
+check "naming the package it lacks" said "some/x86_64/hello-1.1.0-r0.apk is missing; the index lists hello 1.1.0-r0."
+run verify PARAM_DIR=some PARAM_PACKAGES="hello=1.0.0-r0 world=2.1-r3"
+check "V-9: with the same packages, verify accepts it" succeeded
+check "saying it checked the selected packages" said "and the 2 package(s) packages selects."
+check "and records the selection" json_is "${CASE}/apk-repo-receipt.json" 'r["architectures"]["x86_64"]["selection"], len(r["architectures"]["x86_64"]["packages"])' "(['hello=1.0.0-r0', 'world=2.1-r3'], 2)"
+printf 'x' >> "${CASE}/some/x86_64/world-2.1-r3.apk"
+run verify PARAM_DIR=some PARAM_PACKAGES="hello=1.0.0-r0 world=2.1-r3"
+check "V-9: a changed selected package still fails" exited 1
+check "on its signed sidecar" said "its signed sidecar names"
+run pull PARAM_OUT_DIR=all
+run verify PARAM_DIR=all PARAM_PACKAGES="hello=1.1.0-r0"
+check "V-9: verify of a full pull with packages checks only those" succeeded
+check "warning that the others weren't verified" said "WARN: all/x86_64/hello-1.0.0-r0.apk is in the index but not in packages, so it wasn't verified."
+check "once for each package, not for its sidecar" [ "$(grep -c 'not in packages' <<< "${OUTPUT}")" -eq 2 ]
+check "without calling them unlisted" not_said "is not part of the index"
+check "recording that selection" json_is "${CASE}/apk-repo-receipt.json" 'r["architectures"]["x86_64"]["selection"]' "['hello=1.1.0-r0']"
+run verify PARAM_DIR=all
+check "and an unselective one, a null selection" json_is "${CASE}/apk-repo-receipt.json" 'r["architectures"]["x86_64"]["selection"]' "None"
+run pull PARAM_ARCH="x86_64 aarch64" PARAM_OUT_DIR=both PARAM_PACKAGES=$'world=2.1-r3\n'
+check "packages applies to every architecture, and may span lines" succeeded
+check "pulling it for each" json_is "${CASE}/apk-repo-receipt.json" '{a: [p["file"] for p in x["packages"]] for a, x in r["architectures"].items()}' "{'aarch64': ['world-2.1-r3.apk'], 'x86_64': ['world-2.1-r3.apk']}"
+: > "${CASE}/aws.log"
+run pull PARAM_ARCH="x86_64 aarch64" PARAM_OUT_DIR=partial PARAM_PACKAGES="hello=1.1.0-r0"
+check "a version one architecture's index doesn't list fails (1)" exited 1
+check "naming the index and the version" said "s3://bucket/test/os/aarch64/APKINDEX.tar.gz doesn't list hello=1.1.0-r0, which packages selects."
+check "suggesting inspect" said "inspect reports which those are"
+check "and nothing reaches out_dir" absent "${CASE}/partial/x86_64"
+: > "${CASE}/aws.log"
+run pull PARAM_OUT_DIR=unlisted PARAM_PACKAGES="hello=9.9-r0 world=2.1-r3 nope=1.0-r0"
+check "versions the index doesn't list fail (1)" exited 1
+check "naming all of them" said "doesn't list hello=9.9-r0 nope=1.0-r0, which packages selects."
+check "before any package is read" [ "$(grep -c . "${CASE}/aws.log")" -eq 1 ]
+run pull PARAM_OUT_DIR=pinned PARAM_PACKAGES="hello=1.0.0-r0" \
+    PARAM_INDEX_SHA256="$(sha256sum < "$(s3 test/os/x86_64/APKINDEX.tar.gz)" | cut -c1-64)"
+check "packages and index_sha256 work together" json_is "${CASE}/apk-repo-receipt.json" '[p["file"] for p in r["architectures"]["x86_64"]["packages"]], r["architectures"]["x86_64"]["index"]["pinned"]' "(['hello-1.0.0-r0.apk'], True)"
+run pull PARAM_OUT_DIR=cached PARAM_PACKAGES="hello=1.0.0-r0" PARAM_CACHE_DIR=cache
+run pull PARAM_OUT_DIR=cached2 PARAM_PACKAGES="hello=1.0.0-r0" PARAM_CACHE_DIR=cache
+check "and so do packages and cache_dir" said "0 package(s) downloaded, 1 from the cache"
+: > "${CASE}/aws.log"
+# refused_packages DESCRIPTION MESSAGE VALUE: pull and verify with packages
+# VALUE are usage errors (2), saying MESSAGE.
+refused_packages() {
+    run pull PARAM_OUT_DIR=refused PARAM_PACKAGES="$3"
+    check "a usage error (2): $1" exited 2
+    check "saying so" said "$2"
+    run verify PARAM_DIR=all PARAM_PACKAGES="$3"
+    check "for verify too" exited 2
+}
+refused_packages "an entry without a version" "packages entry 'hello' must be <name>=<version>" "hello"
+refused_packages "a version without its release" "'1.0.0' isn't a package version with its release" "hello=1.0.0"
+refused_packages "an invalid name" "'bad@name' isn't a package name" "bad@name=1.0-r0"
+refused_packages "an entry twice" "packages lists hello=1.0.0-r0 more than once" "hello=1.0.0-r0 world=2.1-r3 hello=1.0.0-r0"
+refused_packages "a glob, taken as it is" "packages entry '*' must be <name>=<version>" "*"
+check "no AWS call was made for any of them" not_logged '.'
+
 # ------------------------------------------------------------------ inspect
 echo "=== inspect"
 

@@ -85,6 +85,17 @@ inputs:
       forms. It needs index_sha256, and s3:GetObjectVersion. Without it, a
       pinned pull fails once the index has changed. Empty (the default)
       reads the current version. Environment variables are expanded.
+  packages:
+    default: ""
+    description: >
+      Pull only these packages, not every one the index lists:
+      <name>=<version> entries such as my-package=1.2.3-r0, separated by
+      spaces or newlines, for every architecture in arch. Each must be
+      listed in the index, or the pull fails before downloading any
+      package. out_dir gets the whole signed index and only these packages,
+      so pin apko to exactly these versions (an apko lock file, or
+      name=version in its packages). Empty (the default) pulls every
+      package. Environment variables are expanded.
   receipt_path:
     default: apk-repo-receipt.json
     description: >
@@ -113,6 +124,7 @@ runs:
         PARAM_INDEX_VERSION_ID: ${{ inputs.index_version_id }}
         PARAM_KEYRING: ${{ inputs.keyring }}
         PARAM_OUT_DIR: ${{ inputs.out_dir }}
+        PARAM_PACKAGES: ${{ inputs.packages }}
         PARAM_PREFIX: ${{ inputs.prefix }}
         PARAM_RECEIPT_PATH: ${{ inputs.receipt_path }}
         PARAM_REGION: ${{ inputs.region }}

@@ -183,6 +183,15 @@ check "pull succeeds for both architectures" succeeded
 check "P-3: recording the index's ETag" receipt_is 'r["architectures"]["x86_64"]["index"]["etag"].strip("\"") == "'"${before//\"/}"'"' "True"
 run verify arch="x86_64 aarch64" dir=pulled
 check "verify accepts what pull wrote" succeeded
+run pull arch=x86_64 out_dir=selected packages="world=2.0-r0"
+check "P-10: a selective pull succeeds" succeeded
+check "with only the selected package" [ -f "${CASE}/selected/x86_64/world-2.0-r0.apk" ] && [ ! -e "${CASE}/selected/x86_64/hello-1.0-r0.apk" ]
+check "and the whole index" receipt_is 'r["architectures"]["x86_64"]["selection"], [p["file"] for p in r["architectures"]["x86_64"]["packages"]]' "(['world=2.0-r0'], ['world-2.0-r0.apk'])"
+run verify arch=x86_64 dir=selected packages="world=2.0-r0"
+check "V-9: verify accepts it with the same packages" succeeded
+run pull arch=x86_64 out_dir=unlisted packages="world=9.9-r0"
+check "P-10: a version the index doesn't list fails" failed
+check "naming it" said "doesn't list world=9.9-r0"
 run pull arch=x86_64 out_dir=first cache_dir=cache
 run pull arch=x86_64 out_dir=second cache_dir=cache
 check "P-6: a second pull takes the packages from cache_dir" said "0 package(s) downloaded, 2 from the cache"

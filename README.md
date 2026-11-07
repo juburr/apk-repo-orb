@@ -89,7 +89,7 @@ flowchart LR
 ```
 
 1. **`publish`** takes `packages/<arch>/*.apk` from `melange build`, re-signs each package with your production key (`melange sign`), and writes a SHA-256 sidecar for it, signed with the same key. It uploads the new packages and sidecars with `If-None-Match: *`, so nothing that exists is overwritten, then merges them into the bucket's index with `melange index --merge` and uploads that with `If-Match` on the ETag it read. If another publish changed the index in the meantime, it reads it again and merges again.
-2. **`pull`** reads the index, verifies its signature with your keyring, and downloads exactly the packages it lists, with their signed sidecars, into a private directory. Once every package checks out, it moves them into `out_dir`, ready for apko as a file-path repository.
+2. **`pull`** reads the index, verifies its signature with your keyring, and downloads exactly the packages it lists (or only the versions `packages` names), with their signed sidecars, into a private directory. Once every package checks out, it moves them into `out_dir`, ready for apko as a file-path repository.
 3. **`verify`** checks a local repository offline, with no network and no AWS CLI, against your keyring: the same checks `pull` makes.
 4. **`inspect`** reads and verifies only the index, and lists the packages it holds in a receipt, so a pipeline can build only the versions the repository doesn't have yet.
 
@@ -105,7 +105,7 @@ Publish from one job, pull into another:
 version: 2.1
 
 orbs:
-  apk-repo: juburr/apk-repo-orb@0.3.0
+  apk-repo: juburr/apk-repo-orb@0.2.0
   apko: juburr/apko-orb@1.2.1
   melange: juburr/melange-orb@1.3.0
 
@@ -195,7 +195,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.APK_PUBLISH_ROLE_ARN }}
           aws-region: us-east-1
-      - uses: juburr/apk-repo-orb/actions/publish@v0.3.0
+      - uses: juburr/apk-repo-orb/actions/publish@v0.2.0
         env:
           APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
         with:
@@ -274,6 +274,24 @@ A missing index fails, as it does for `pull`, unless `allow_missing` is set: the
 
 With `cache_dir`, a package from an earlier pull is reused when its SHA-256 matches its signed sidecar, and new packages are added. Save and restore it with `save_cache` and `restore_cache` (or `actions/cache`).
 
+### Selective pulls
+
+Nothing is ever deleted, so an index lists every version ever published, and a full pull reads more each time. `packages` pulls only the versions you name, as `<name>=<version>` entries separated by spaces or newlines, for every architecture in `arch`:
+
+```yaml
+- apk-repo/pull:
+    bucket: my-org-apk
+    prefix: my-org/os
+    keyring: keys
+    packages: my-package=1.2.3-r0 my-lib=0.4.1-r2
+```
+
+Every entry must be listed in the verified index, or the pull fails before it reads any package ("… doesn't list …"; `inspect` reports what is listed). Each selected package is checked as in a full pull, and only those packages and their sidecars are read. The receipt lists the packages pulled, and records the entries as `selection`.
+
+`out_dir/<arch>` gets the whole signed index, since a smaller one can't be signed without the private key, and only the selected packages. apko installs the newest version that matches, so an index that lists packages the directory doesn't have needs apko pinned to exactly the versions pulled: build from an apko lock file, or give each package its version (`my-package=1.2.3-r0`). Otherwise apko can pick a version that isn't there and fail. Dependencies are not resolved: name every package apko should take from the directory. To pull different versions for each architecture, pull each architecture in its own step; each fills its own `out_dir/<arch>`.
+
+`verify` takes the same `packages`, and then requires and checks only those packages. Without it, `verify` refuses a selective pull's directory, which lacks packages the index lists.
+
 ### Pinned reads
 
 A pull normally takes whatever index is current. To pull the same snapshot again, for a rebuild or an audit, pin the index with the `index.sha256` (and, in a versioned bucket, the `index.version_id`) that an earlier receipt recorded:
@@ -305,7 +323,7 @@ Every command writes JSON to `receipt_path` (default `apk-repo-receipt.json`) an
 {
   "schema_version": 1,
   "tool": "apk-repo-orb",
-  "tool_version": "0.3.0",
+  "tool_version": "0.2.0",
   "operation": "publish",
   "dry_run": false,
   "backend": "s3",
@@ -335,7 +353,7 @@ Every command writes JSON to `receipt_path` (default `apk-repo-receipt.json`) an
 }
 ```
 
-`packages` lists every package in the resulting (publish), verified (pull, verify) or inspected (inspect) index; `inspect` reads no sidecar, so its packages' `sha256` is `null`, and with `allow_missing` an architecture without an index has `"index": null` and no packages. `published`, `skipped_identical` and `attempts` appear for `publish` only, and `index.pinned` (`true` when `index_sha256` pinned the index) for `pull`, `verify` and `inspect` only. `index.sha256` and `index.version_id` are the values a later pull pins (see [Pinned reads](#pinned-reads)). `version_id` is set in a versioned bucket. For `verify`, `index.key` is the local path, and `backend`, `endpoint_url`, `bucket`, `prefix` and `key_name` are `null`. Receipts never hold credentials or key material.
+`packages` lists every package in the resulting (publish), verified (pull, verify) or inspected (inspect) index; `inspect` reads no sidecar, so its packages' `sha256` is `null`, and with `allow_missing` an architecture without an index has `"index": null` and no packages. `published`, `skipped_identical` and `attempts` appear for `publish` only, `index.pinned` (`true` when `index_sha256` pinned the index) for `pull`, `verify` and `inspect` only, and `selection` (the `packages` entries, or `null` for every package) for `pull` and `verify` only. `index.sha256` and `index.version_id` are the values a later pull pins (see [Pinned reads](#pinned-reads)). `version_id` is set in a versioned bucket. For `verify`, `index.key` is the local path, and `backend`, `endpoint_url`, `bucket`, `prefix` and `key_name` are `null`. Receipts never hold credentials or key material.
 
 ## 🧰 CircleCI Commands
 
@@ -377,6 +395,7 @@ Downloads the repository into `out_dir`, verified, as described in [Pulling and 
 | `arch` | `""` | `x86_64` and/or `aarch64`, space-separated. Empty is the machine's own (`uname -m`). |
 | `out_dir` | `packages` | Where to put the repository. Each `out_dir/<arch>` must not exist yet, or be empty. |
 | `cache_dir` | `""` | A directory of packages from earlier pulls, reused when they match their signed sidecars. Empty caches nothing. |
+| `packages` | `""` | Only these packages: `<name>=<version>` entries separated by spaces or newlines, each listed in the index. See [Selective pulls](#selective-pulls). Empty pulls every package. |
 | `index_sha256` | `""` | The SHA-256 the index must have, from an earlier receipt's `index.sha256`: one value, or `<arch>=<sha256>` pairs for several architectures. See [Pinned reads](#pinned-reads). Empty takes the current index. |
 | `index_version_id` | `""` | The version of the index to read in a versioned bucket, from the same receipt's `index.version_id`, in the same forms. Needs `index_sha256`. Empty reads the current version. |
 | `endpoint_url` | `""` | An S3-compatible service's endpoint. Empty is AWS. |
@@ -394,6 +413,7 @@ Verifies a local repository offline, with no network and no AWS CLI.
 | `dir` | `packages` | The repository directory, holding `<arch>/APKINDEX.tar.gz` and the packages. |
 | `arch` | `""` | `x86_64` and/or `aarch64`, space-separated. Empty is the machine's own. |
 | `index_sha256` | `""` | The SHA-256 the index must have, from the receipt of the pull or publish that made it: one value, or `<arch>=<sha256>` pairs. Empty checks only the signature. |
+| `packages` | `""` | Verify only these packages, as a selective pull's `packages` chose them. Listed packages it doesn't name are neither required nor checked. Empty requires every package the index lists. |
 | `receipt_path` | `apk-repo-receipt.json` | Where to write the receipt. |
 
 ### `apk-repo/inspect`
@@ -431,14 +451,14 @@ Each command has a GitHub Action of the same name. The actions run the same scri
           role-to-assume: ${{ vars.APK_PULL_ROLE_ARN }}
           aws-region: us-east-1
       - id: pull
-        uses: juburr/apk-repo-orb/actions/pull@v0.3.0
+        uses: juburr/apk-repo-orb/actions/pull@v0.2.0
         with:
           bucket: my-org-apk
           prefix: my-org/os
           keyring: keys
       # pull has verified it already; verify checks a copy offline, such as
       # one a later job received as an artifact.
-      - uses: juburr/apk-repo-orb/actions/verify@v0.3.0
+      - uses: juburr/apk-repo-orb/actions/verify@v0.2.0
         with:
           dir: packages
           keyring: keys
@@ -456,8 +476,8 @@ Each command has a GitHub Action of the same name. The actions run the same scri
 
 How they differ from the orb's commands:
 
-- **Inspecting.** `juburr/apk-repo-orb/actions/inspect@v0.3.0` returns the same `receipt` output, which a later step can read with `jq`, as in [Inspecting](#-inspecting).
-- **Versions.** Reference an action by the repository's release tag, such as `v0.3.0`, the tag the orb is published from, or for the strongest pinning by that tag's commit SHA: `juburr/apk-repo-orb/actions/publish@<sha> # v0.3.0`.
+- **Inspecting.** `juburr/apk-repo-orb/actions/inspect@v0.2.0` returns the same `receipt` output, which a later step can read with `jq`, as in [Inspecting](#-inspecting).
+- **Versions.** Reference an action by the repository's release tag, such as `v0.2.0`, the tag the orb is published from, or for the strongest pinning by that tag's commit SHA: `juburr/apk-repo-orb/actions/publish@<sha> # v0.2.0`.
 - **The signing key.** `signing_key` names an environment variable, as in the orb. Set it on the step from a secret (`env: APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}`), so it never appears as an input.
 - **Environment variables.** The orb expands `$NAME` in string parameters with the CircleCI CLI, which GitHub's runners don't have, so the actions take values as they are. Use GitHub's expressions instead.
 - **Runners.** GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners have everything the actions need, and CI runs every action on both.

@@ -32,6 +32,9 @@ set -euo pipefail
 #                       The S3 version of each architecture's index to
 #                       read, in the same forms; needs PARAM_INDEX_SHA256
 #                       (default: none, the current version).
+#   PARAM_PACKAGES      Only these packages, as <name>=<version> entries
+#                       separated by spaces, each listed in the index
+#                       (default: none, every package the index lists).
 #   PARAM_RECEIPT_PATH  Where to write the JSON receipt (default
 #                       apk-repo-receipt.json).
 # Environment variables in them are expanded when the CircleCI CLI is on
@@ -67,6 +70,7 @@ KEYRING=$(ar_subst "${PARAM_KEYRING:-}")
 OUT_DIR=$(ar_subst "${PARAM_OUT_DIR:-packages}")
 CACHE_DIR=$(ar_subst "${PARAM_CACHE_DIR:-}")
 INDEX_SHA256=$(ar_subst "${PARAM_INDEX_SHA256:-}")
+PACKAGES=$(ar_subst "${PARAM_PACKAGES:-}")
 INDEX_VERSION_ID=$(ar_subst "${PARAM_INDEX_VERSION_ID:-}")
 RECEIPT_PATH=$(ar_subst "${PARAM_RECEIPT_PATH:-apk-repo-receipt.json}")
 
@@ -87,6 +91,7 @@ fi
 # shellcheck disable=SC2034 # filled and read by the lib
 declare -A AR_PIN_SHA256=() AR_PIN_VERSION_ID=()
 ar_index_pins "${INDEX_SHA256}" "${INDEX_VERSION_ID}"
+ar_selection "${PACKAGES}"
 ar_need_tools python3 openssl
 ar_need_aws
 # shellcheck disable=SC2034 # filled and read by the lib
@@ -114,6 +119,12 @@ for arch in "${AR_ARCHES[@]}"; do
     mkdir -p "${stage}"
     key="${PREFIX}/${arch}/APKINDEX.tar.gz"
     ar_read_index "${arch}" "${key}" "${stage}/APKINDEX.tar.gz" "${AR_WORK}/${arch}"
+    # A selective pull: the signed index as it is, and only these packages.
+    ar_select_entries "${AR_WORK}/${arch}" "$(ar_s3_url "${key}")"
+    mkdir -p "${AR_WORK}/receipt/arch/${arch}"
+    if [[ ${#AR_SELECTION[@]} -gt 0 ]]; then
+        printf '%s\n' "${AR_SELECTION[@]}" > "${AR_WORK}/receipt/arch/${arch}/selection"
+    fi
     etag=${AR_INDEX_ETAG}
     version_id=${AR_INDEX_VERSION_ID}
 
