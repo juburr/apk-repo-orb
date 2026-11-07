@@ -223,3 +223,84 @@ jobs:
             echo "The image didn't run the pulled package's script."
             exit 1
           fi
+      # A second version beside the first, and a selective pull of the
+      # first: apko pinned to it must run its script, and apko unpinned
+      # must fail on the second, which the index lists and the pull didn't
+      # fetch.
+      - uses: juburr/melange-orb/actions/build@852099260f7e1813459ba515f0104d1889709d32 # v1.3.0
+        with:
+          config: tests/fixtures/melange-next.yaml
+          signing_key: build.rsa
+      - uses: ./actions/publish
+        with:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          key_name: apk-repo-test.rsa
+          receipt_path: publish-next.json
+      - uses: ./actions/pull
+        with:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          out_dir: selected
+          packages: apk-repo-hello=0.0.1-r0
+          receipt_path: pull-selected.json
+      - uses: ./actions/verify
+        with:
+          dir: selected
+          keyring: keyring
+          packages: apk-repo-hello=0.0.1-r0
+          receipt_path: verify-selected.json
+      - name: Check the selective pull
+        run: |
+          python3 -I - publish-next.json pull-selected.json verify-selected.json "$(uname -m)" << 'EOF'
+          import json, os, sys
+          publish, pull, verify = (json.load(open(path)) for path in sys.argv[1:4])
+          arch = sys.argv[4]
+          assert publish["architectures"][arch]["published"] == ["apk-repo-hello-0.0.2-r0.apk"], publish
+          assert publish["architectures"][arch]["skipped_identical"] == ["apk-repo-hello-0.0.1-r0.apk"], publish
+          for receipt in (pull, verify):
+              assert receipt["architectures"][arch]["selection"] == ["apk-repo-hello=0.0.1-r0"], receipt
+              files = [p["file"] for p in receipt["architectures"][arch]["packages"]]
+              assert files == ["apk-repo-hello-0.0.1-r0.apk"], files
+          pulled = sorted(name for name in os.listdir(os.path.join("selected", arch)) if name.endswith(".apk"))
+          assert pulled == ["apk-repo-hello-0.0.1-r0.apk"], pulled
+          print("The index lists 0.0.1 and 0.0.2; the selective pull fetched", pulled)
+          EOF
+      - uses: juburr/apko-orb/actions/build@86c2a8bd10def2c8cb0232184ef180213a27b0e5 # v1.2.1
+        with:
+          config: tests/fixtures/apko-selected.yaml
+          image: apk-repo-selected:latest
+          arch: host
+          log_level: info
+          output_path: image/selected.tar
+      - name: Run the image built from the selective pull
+        run: |
+          case "$(uname -m)" in
+            x86_64) tag=amd64 ;;
+            aarch64) tag=arm64 ;;
+          esac
+          docker load --input image/selected.tar
+          OUTPUT=$(docker run --rm "apk-repo-selected:latest-${tag}")
+          echo "${OUTPUT}"
+          if [[ "${OUTPUT}" != "hello from apk-repo-orb" ]]; then
+            echo "The image didn't run 0.0.1's script, the version pulled."
+            exit 1
+          fi
+      - name: apko refuses the selective pull without the version pin
+        run: |
+          if apko build tests/fixtures/apko-unpinned.yaml apk-repo-unpinned:latest image/unpinned.tar \
+              --arch "$(uname -m)" > unpinned.log 2>&1; then
+            tail -n 20 unpinned.log
+            echo "apko built an image without the pin; the README's advice to pin apko needs revisiting."
+            exit 1
+          fi
+          tail -n 20 unpinned.log
+          if ! grep -q 'apk-repo-hello-0.0.2-r0' unpinned.log; then
+            echo "apko failed, but not on apk-repo-hello 0.0.2, the version the pull didn't fetch."
+            exit 1
+          fi
+          echo "As the README says, apko unpinned picks 0.0.2, which the selective pull didn't fetch, and fails."
