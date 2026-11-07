@@ -108,6 +108,27 @@ parameters:
     description: >
       Send each upload's SHA-256 for S3 to check (--checksum-sha256). Turn it
       off for S3-compatible services that reject checksum headers.
+  multipart_threshold:
+    type: string
+    default: 5GB
+    description: >
+      Upload a package this large or larger as a multipart upload, in parts
+      of multipart_chunksize, completed with If-None-Match like every other
+      package. A size such as 64MB or 5GB, counted in 1024s as the AWS CLI's
+      own setting of the same name; from 5MB to 5GB. The default, 5GB, is
+      the largest a single PutObject takes, so only a package that can't go
+      up in one request uses parts. The first package of this size in a
+      publish makes it prove the service enforces If-None-Match on
+      CompleteMultipartUpload. Environment variables are expanded.
+  multipart_chunksize:
+    type: string
+    default: 64MB
+    description: >
+      The size of each part of a multipart upload: a whole number of MB
+      from 5MB to 5GB, such as 64MB. A package that would need more than
+      10,000 parts uses larger ones. Parts upload 8 at a time, each from a
+      temporary file of its own, so a publish needs about 8 times this much
+      free disk. Environment variables are expanded.
   dry_run:
     type: boolean
     default: false
@@ -134,6 +155,8 @@ steps:
         PARAM_KEY_NAME: << parameters.key_name >>
         PARAM_KEYRING: << parameters.keyring >>
         PARAM_MAX_ATTEMPTS: << parameters.max_attempts >>
+        PARAM_MULTIPART_CHUNKSIZE: << parameters.multipart_chunksize >>
+        PARAM_MULTIPART_THRESHOLD: << parameters.multipart_threshold >>
         PARAM_PACKAGES_DIR: << parameters.packages_dir >>
         PARAM_PREFIX: << parameters.prefix >>
         PARAM_PUBLISH_PUBLIC_KEY: << parameters.publish_public_key >>

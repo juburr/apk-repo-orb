@@ -100,6 +100,66 @@ commands:
             assert packages[0]["sha256"] is None and packages[0]["size"] > 0, packages
             print("Before publishing, no repository; after,", [p["file"] for p in packages])
             EOF
+  # A selective pull (packages) of 0.0.1, with 0.0.2 published beside it: only 0.0.1 is
+  # pulled, the whole index with it, and verify accepts it with the same packages.
+  check-selective-pull:
+    steps:
+      - run:
+          name: Check the selective pull
+          command: |
+            python3 -I - publish-next.json pull-selected.json verify-selected.json "$(uname -m)" \<< 'EOF'
+            import json, os, sys
+            publish, pull, verify = (json.load(open(path)) for path in sys.argv[1:4])
+            arch = sys.argv[4]
+            assert publish["architectures"][arch]["published"] == ["apk-repo-hello-0.0.2-r0.apk"], publish
+            assert publish["architectures"][arch]["skipped_identical"] == ["apk-repo-hello-0.0.1-r0.apk"], publish
+            for receipt in (pull, verify):
+                assert receipt["architectures"][arch]["selection"] == ["apk-repo-hello=0.0.1-r0"], receipt
+                files = [p["file"] for p in receipt["architectures"][arch]["packages"]]
+                assert files == ["apk-repo-hello-0.0.1-r0.apk"], files
+            pulled = sorted(name for name in os.listdir(os.path.join("selected", arch)) if name.endswith(".apk"))
+            assert pulled == ["apk-repo-hello-0.0.1-r0.apk"], pulled
+            print("The index lists 0.0.1 and 0.0.2; the selective pull fetched", pulled)
+            EOF
+  # apko builds images from the selective pull: pinned to 0.0.1, it must run 0.0.1's script;
+  # unpinned, it must fail on 0.0.2, which the index lists and the pull didn't fetch.
+  run-selected-image:
+    steps:
+      - apko-orb/build:
+          config: tests/fixtures/apko-selected.yaml
+          image: apk-repo-selected:latest
+          arch: host
+          log_level: info
+          output_path: image/selected.tar
+      - run:
+          name: Run the image built from the selective pull
+          command: |
+            case "$(uname -m)" in
+              x86_64) tag=amd64 ;;
+              aarch64) tag=arm64 ;;
+            esac
+            docker load --input image/selected.tar
+            OUTPUT=$(docker run --rm "apk-repo-selected:latest-${tag}")
+            echo "${OUTPUT}"
+            if [[ "${OUTPUT}" != "hello from apk-repo-orb" ]]; then
+              echo "The image didn't run 0.0.1's script, the version pulled."
+              exit 1
+            fi
+      - run:
+          name: apko refuses the selective pull without the version pin
+          command: |
+            if apko build tests/fixtures/apko-unpinned.yaml apk-repo-unpinned:latest image/unpinned.tar \
+                --arch "$(uname -m)" > unpinned.log 2>&1; then
+              tail -n 20 unpinned.log
+              echo "apko built an image without the pin; the README's advice to pin apko needs revisiting."
+              exit 1
+            fi
+            tail -n 20 unpinned.log
+            if ! grep -q 'apk-repo-hello-0.0.2-r0' unpinned.log; then
+              echo "apko failed, but not on apk-repo-hello 0.0.2, the version the pull didn't fetch."
+              exit 1
+            fi
+            echo "As the README says, apko unpinned picks 0.0.2, which the selective pull didn't fetch, and fails."
   # apko builds an image from the pulled repository, which must run the package's script.
   run-test-image:
     steps:
@@ -166,7 +226,9 @@ jobs:
             RACE_ROUNDS: "20"
   # T-6: the orb's commands as a pipeline runs them: melange builds a package, publish uploads
   # it, pull fetches it into a fresh directory, verify checks it, and apko builds an image from
-  # it, which must run the package's script.
+  # it, which must run the package's script. Then a second version is published, and a
+  # selective pull of the first must give an image that runs the first's script, as long as
+  # apko is pinned to it.
   end-to-end-test:
     parameters:
       executor:
@@ -214,6 +276,32 @@ jobs:
           dir: pulled
           keyring: keyring
       - run-test-image
+      # A second version beside the first, and a selective pull of the first.
+      - melange-orb/build:
+          config: tests/fixtures/melange-next.yaml
+          signing_key: build.rsa
+      - apk-repo-orb/publish:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          key_name: apk-repo-test.rsa
+          receipt_path: publish-next.json
+      - apk-repo-orb/pull:
+          bucket: apk-repo-e2e
+          prefix: e2e/os
+          endpoint_url: http://localhost:7070
+          keyring: keyring
+          out_dir: selected
+          packages: apk-repo-hello=0.0.1-r0
+          receipt_path: pull-selected.json
+      - apk-repo-orb/verify:
+          dir: selected
+          keyring: keyring
+          packages: apk-repo-hello=0.0.1-r0
+          receipt_path: verify-selected.json
+      - check-selective-pull
+      - run-selected-image
   # T-7: the integration tests (10 race rounds) and the end-to-end pipeline against Amazon S3
   # itself, with the IAM user and bucket in the s3_apk_test_rw context (AWS_ACCESS_KEY_ID,
   # AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_S3_BUCKET_NAME). Each run writes under its own

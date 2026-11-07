@@ -231,12 +231,12 @@ The bucket holds a standard APK v2 repository that `apk` and apko understand, pl
 
 `publish` runs these steps for each architecture in `packages_dir` (or in `arch`):
 
-1. **Checks before any write.** Every name, version, prefix and key name is validated. The private key in `$APK_SIGNING_KEY` must match the keyring's `<key_name>.pub`. melange, the AWS CLI (2.22.5 or newer, the first whose `put-object` takes `--if-match`), python3 and openssl must be on the `PATH`. A package over 5 GiB is refused, since multipart uploads aren't supported yet.
+1. **Checks before any write.** Every name, version, prefix and key name is validated. The private key in `$APK_SIGNING_KEY` must match the keyring's `<key_name>.pub`. melange, the AWS CLI (2.22.5 or newer, the first whose `put-object` takes `--if-match`), python3 and openssl must be on the `PATH`. A package over 5 TiB, S3's largest object, is refused. When a package is `multipart_threshold` or larger, the AWS CLI's `complete-multipart-upload` must take `--if-none-match` too.
 2. **Prepares the packages** in a private directory; `packages_dir` is never modified, and melange's own `APKINDEX.tar.gz` there is ignored. Each package must be named `<name>-<version>.apk` and be built for its directory's architecture. With `resign` (the default), `melange sign` replaces melange's build-time signature with the production key's, and the result must carry that signature alone.
-3. **Probes the bucket.** It writes `<prefix>/.apk-repo-orb/probe` with fixed bytes and `If-None-Match: *`, writes it again (which must fail with 412), and writes it with an `If-Match` that can't match (which must fail with 412 too). If either succeeds, the bucket ignores conditional writes and `publish` stops: `ERROR: <endpoint> does not enforce S3 conditional writes; refusing to publish`. The writes never change the object.
+3. **Probes the bucket.** It writes `<prefix>/.apk-repo-orb/probe` with fixed bytes and `If-None-Match: *`, writes it again (which must fail with 412), and writes it with an `If-Match` that can't match (which must fail with 412 too). If either succeeds, the bucket ignores conditional writes and `publish` stops: `ERROR: <endpoint> does not enforce S3 conditional writes; refusing to publish`. When a package will go up in parts, it also completes a multipart upload of the same bytes onto the probe object with `If-None-Match: *`, which must fail with 412 as well, since some services honor the condition on `PutObject` but not on `CompleteMultipartUpload`. The writes never change the object.
 4. **Reads the index** and verifies it with the keyring. A missing index is an error unless `allow_create` is set, so a mistyped prefix never starts a new repository. Access denied (403) is always an error, never "no repository".
 5. **Sorts the packages.** A package the index doesn't list is new. One it lists must be the same package: the same bytes, or the same control and data segments signed differently. Anything else fails: published packages never change, so publish a new build under a new version or epoch (`-r<N>`).
-6. **Uploads the new packages and sidecars** with `If-None-Match: *`, before the index, so no index ever lists a package that isn't there.
+6. **Uploads the new packages and sidecars** with `If-None-Match: *`, before the index, so no index ever lists a package that isn't there. A package of `multipart_threshold` (default 5 GB, the most a single `PutObject` takes) or more goes up as a multipart upload in parts of `multipart_chunksize` (default 64 MB), 8 at a time, each with its SHA-256 when `s3_checksums` is on, and the upload is completed with `If-None-Match: *` too, so it can't replace an object either. A failed upload is aborted. Each part is cut into a temporary file of its own, so a publish needs about 8 parts' worth of free disk.
 7. **Merges and uploads the index.** `melange index --merge` writes the new index, signed with the production key. `publish` checks that it lists exactly the old entries, unchanged, plus the new ones, then uploads it with `If-Match` on the ETag read in step 4 (or `If-None-Match: *` when creating). On 412 or 409, another publish got there first: it waits (with jittered backoff), reads the index again and merges again, up to `max_attempts` times.
 
 Architectures are published independently: one that fails doesn't undo another, and the step fails naming the ones that did. `dry_run` does everything but write, and reports what it would publish. The receipt (below) is written only when everything succeeds.
@@ -377,6 +377,8 @@ Publishes `packages_dir/<arch>/*.apk` to the repository at `s3://<bucket>/<prefi
 | `max_attempts` | `5` | How many times to merge and upload an index that another publish keeps changing. |
 | `publish_public_key` | `false` | Also upload `<prefix>/<key_name>.pub`, a convenience copy. |
 | `s3_checksums` | `true` | Send each upload's SHA-256 for S3 to check. See [S3-compatible services](#s3-compatible-services). |
+| `multipart_threshold` | `5GB` | Upload a package this large or larger in parts, as the AWS CLI setting of the same name: a size such as `64MB` or `5GB` (counted in 1024s), from `5MB` to `5GB`. |
+| `multipart_chunksize` | `64MB` | The size of each part: a whole number of MB from `5MB` to `5GB`. A package that would need more than 10,000 parts uses larger ones. |
 | `dry_run` | `false` | Read, verify and prepare everything, write nothing, and report what would be published. |
 | `endpoint_url` | `""` | An S3-compatible service's endpoint: `https://`, or `http://` to localhost. Empty is AWS. |
 | `region` | `""` | The bucket's region. Empty leaves it to the AWS CLI (`AWS_REGION`, its config). |
@@ -518,7 +520,7 @@ To pull an earlier version of an index (`index_version_id`), also allow `s3:GetO
 
 ### IAM policy for `publish`
 
-The `pull` policy plus `s3:PutObject` on the prefix. Grant no `s3:DeleteObject` and no `s3:PutObjectAcl`: the orb never deletes or changes ACLs.
+The `pull` policy plus `s3:PutObject` on the prefix, and `s3:AbortMultipartUpload`, which a package of `multipart_threshold` or more needs to discard the parts of an upload that fails (it removes no object). Grant no `s3:DeleteObject` and no `s3:PutObjectAcl`: the orb never deletes or changes ACLs.
 
 ```json
 {
@@ -526,7 +528,7 @@ The `pull` policy plus `s3:PutObject` on the prefix. Grant no `s3:DeleteObject` 
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
       "Resource": "arn:aws:s3:::my-org-apk/my-org/os/*"
     },
     {
@@ -541,7 +543,7 @@ The `pull` policy plus `s3:PutObject` on the prefix. Grant no `s3:DeleteObject` 
 
 ### Bucket policy (recommended)
 
-Defense in depth, so that no client, this orb or another, can overwrite a package. It uses the condition keys from AWS's [Enforce conditional writes on Amazon S3 buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html). The first statement denies any write without `If-None-Match` (so objects can be created, never replaced) everywhere except the indexes and the probe object. The second denies writes to those with neither `If-None-Match` nor `If-Match`. `s3:ObjectCreationOperation` exempts the parts of multipart uploads, as AWS's examples do. It assumes the bucket holds only APK repositories.
+Defense in depth, so that no client, this orb or another, can overwrite a package. It uses the condition keys from AWS's [Enforce conditional writes on Amazon S3 buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html). The first statement denies any write without `If-None-Match` (so objects can be created, never replaced) everywhere except the indexes and the probe object. The second denies writes to those with neither `If-None-Match` nor `If-Match`. `s3:ObjectCreationOperation` exempts the parts of multipart uploads, as AWS's examples do; their `CompleteMultipartUpload` carries `If-None-Match` like any other write of a package. It assumes the bucket holds only APK repositories.
 
 ```json
 {
@@ -583,7 +585,7 @@ With this policy, copy operations (`CopyObject`) into the bucket fail, as AWS's 
 
 ### Versioning and lifecycle
 
-Turn on **versioning**: an index replaced by mistake can be restored, and receipts record each index's `version_id`, which a pinned pull can read again (`index_version_id`). A lifecycle rule that expires noncurrent versions makes those pulls fail once the version is gone, so keep noncurrent index versions for as long as you may need to pull them again. Add a lifecycle rule that **aborts incomplete multipart uploads** after a day. [Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html) can also keep every object version from being deleted or overwritten for a retention period; with a default retention, that includes each superseded version of the index.
+Turn on **versioning**: an index replaced by mistake can be restored, and receipts record each index's `version_id`, which a pinned pull can read again (`index_version_id`). A lifecycle rule that expires noncurrent versions makes those pulls fail once the version is gone, so keep noncurrent index versions for as long as you may need to pull them again. Add a lifecycle rule that **aborts incomplete multipart uploads** after a day: `publish` aborts an upload that fails, but a job killed mid-upload can't. [Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html) can also keep every object version from being deleted or overwritten for a retention period; with a default retention, that includes each superseded version of the index.
 
 ### OIDC: no stored AWS keys
 
@@ -641,7 +643,7 @@ The orb is a CI-side client; nothing serves the bucket. Should you want apko to 
 
 ### S3-compatible services
 
-Set `endpoint_url`. When it is empty and the AWS CLI would take an endpoint from `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL`, the orb uses that one instead, checks it the same way (`https://`, or `http://` to localhost), and names it in the receipt; an `endpoint_url` in an AWS CLI profile isn't seen. CI tests against [versitygw](https://github.com/versity/versitygw) v1.10.0, which enforces both conditions atomically, and against Amazon S3 itself. Other services may work if `publish`'s probe passes, and it refuses those that ignore conditional writes. Services known to ignore them on `PutObject` include Garage, Zenko CloudServer and `rclone serve s3`.
+Set `endpoint_url`. When it is empty and the AWS CLI would take an endpoint from `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL`, the orb uses that one instead, checks it the same way (`https://`, or `http://` to localhost), and names it in the receipt; an `endpoint_url` in an AWS CLI profile isn't seen. CI tests against [versitygw](https://github.com/versity/versitygw) v1.10.0, which enforces both conditions atomically, and against Amazon S3 itself. Other services may work if `publish`'s probe passes, and it refuses those that ignore conditional writes. Services known to ignore them on `PutObject` include Garage, Zenko CloudServer and `rclone serve s3`. Packages of `multipart_threshold` or more need the condition on `CompleteMultipartUpload` too, which `publish` probes separately, only when it needs it.
 
 The AWS CLI computes a CRC checksum for every upload by default, and `publish` also sends each upload's SHA-256 (`s3_checksums`). For a service that rejects checksum headers, set `s3_checksums: false` and these AWS CLI settings in the job's environment:
 

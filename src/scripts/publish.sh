@@ -37,6 +37,10 @@ set -euo pipefail
 #                             false).
 #   PARAM_S3_CHECKSUMS        Send each upload's SHA-256 for S3 to check
 #                             (default true).
+#   PARAM_MULTIPART_THRESHOLD Upload packages this large or larger in parts,
+#                             as a size such as 64MB or 5GB (default 5GB,
+#                             the largest a single PutObject takes).
+#   PARAM_MULTIPART_CHUNKSIZE The size of each part (default 64MB).
 #   PARAM_DRY_RUN             Do everything but write (default false).
 #   PARAM_RECEIPT_PATH        Where to write the JSON receipt (default
 #                             apk-repo-receipt.json).
@@ -68,7 +72,6 @@ trap 'rm -rf "${AR_WORK}"' EXIT
 
 IMMUTABLE_CACHE="max-age=31536000, immutable"
 PROBE_BYTES="apk-repo-orb conditional write probe v1"
-FIVE_GIB=$((5 * 1024 * 1024 * 1024))
 
 BACKEND=$(ar_subst "${PARAM_BACKEND:-s3}")
 BUCKET=$(ar_subst "${PARAM_BUCKET:-}")
@@ -86,6 +89,8 @@ MAX_ATTEMPTS=$(ar_subst "${PARAM_MAX_ATTEMPTS:-5}")
 PUBLISH_PUBLIC_KEY=$(ar_bool publish_public_key "${PARAM_PUBLISH_PUBLIC_KEY:-false}")
 # shellcheck disable=SC2034 # read by ar_put_object
 AR_S3_CHECKSUMS=$(ar_bool s3_checksums "${PARAM_S3_CHECKSUMS:-true}")
+MULTIPART_THRESHOLD=$(ar_size multipart_threshold "$(ar_subst "${PARAM_MULTIPART_THRESHOLD:-5GB}")") || exit $?
+MULTIPART_CHUNKSIZE=$(ar_size multipart_chunksize "$(ar_subst "${PARAM_MULTIPART_CHUNKSIZE:-64MB}")") || exit $?
 DRY_RUN=$(ar_bool dry_run "${PARAM_DRY_RUN:-false}")
 RECEIPT_PATH=$(ar_subst "${PARAM_RECEIPT_PATH:-apk-repo-receipt.json}")
 
@@ -96,6 +101,12 @@ ar_check_endpoint "${ENDPOINT_URL}"
 ar_check_region "${REGION}"
 ar_check_key_name "${KEY_NAME}"
 ar_check_receipt_path "${RECEIPT_PATH}"
+if (( MULTIPART_THRESHOLD < AR_MIN_PART || MULTIPART_THRESHOLD > AR_MAX_PART )); then
+    ar_usage "multipart_threshold must be from 5MB to 5GB: a single PutObject takes at most 5 GiB, and a part at least 5 MiB."
+fi
+if (( MULTIPART_CHUNKSIZE < AR_MIN_PART || MULTIPART_CHUNKSIZE > AR_MAX_PART || MULTIPART_CHUNKSIZE % 1048576 != 0 )); then
+    ar_usage "multipart_chunksize must be a whole number of MB from 5MB to 5GB, S3's limits for a part."
+fi
 if ! ar_match "${MAX_ATTEMPTS}" '^[1-9][0-9]?$'; then
     ar_usage "max_attempts must be a number from 1 to 99, not '${MAX_ATTEMPTS}'."
 fi
@@ -241,8 +252,8 @@ for arch in "${AR_ARCHES[@]}"; do
     fi
     for package in "${PACKAGES_DIR}/${arch}"/*.apk; do
         base=$(basename -- "${package}")
-        if [[ "$(stat -L -c %s -- "${package}")" -gt "${FIVE_GIB}" ]]; then
-            ar_die "${package} exceeds 5 GiB; multipart upload is not supported yet."
+        if [[ "$(stat -L -c %s -- "${package}")" -gt "${AR_MAX_OBJECT}" ]]; then
+            ar_die "${package} is larger than 5 TiB, the largest object S3 stores."
         fi
         cp -- "${package}" "${stage}/${base}"
         inspect "${stage}/${base}"
@@ -279,6 +290,20 @@ for arch in "${AR_ARCHES[@]}"; do
     echo "Prepared $(find "${stage}" -maxdepth 1 -name '*.apk' | wc -l | tr -d ' ') ${arch} package(s) from ${PACKAGES_DIR}/${arch}."
 done
 
+# Packages of multipart_threshold or more (as re-signed) go up in parts, and
+# need an AWS CLI that completes a multipart upload conditionally.
+MULTIPART=false
+for arch in "${AR_ARCHES[@]}"; do
+    for package in "${AR_WORK}/stage/${arch}"/*.apk; do
+        if [[ "$(stat -c %s -- "${package}")" -ge "${MULTIPART_THRESHOLD}" ]]; then
+            MULTIPART=true
+        fi
+    done
+done
+if [[ "${MULTIPART}" == "true" ]]; then
+    ar_need_aws_multipart
+fi
+
 # ------------------------------------------------------------------ writes
 
 # backoff ATTEMPT: sleeps a random time up to min(30, 2^(ATTEMPT-1)) seconds.
@@ -297,7 +322,11 @@ put_immutable() {
     local key=$1 file=$2 type=$3 status attempt=1
     while true; do
         status=0
-        ar_put_object "${key}" "${file}" "${type}" "${IMMUTABLE_CACHE}" "*" || status=$?
+        if [[ "$(stat -L -c %s -- "${file}")" -ge "${MULTIPART_THRESHOLD}" ]]; then
+            ar_put_multipart "${key}" "${file}" "${type}" "${IMMUTABLE_CACHE}" "${MULTIPART_CHUNKSIZE}" || status=$?
+        else
+            ar_put_object "${key}" "${file}" "${type}" "${IMMUTABLE_CACHE}" "*" || status=$?
+        fi
         case "${status}" in
             0)
                 PUT_RESULT=uploaded
@@ -319,7 +348,7 @@ put_immutable() {
                 fi
                 ;;
             "${AR_DENIED}") ar_die "Writing $(ar_s3_url "${key}") was denied." \
-                "publish needs s3:PutObject and s3:GetObject on $(ar_s3_url "${PREFIX}")/* (README: Bucket Setup)." ;;
+                "publish needs s3:PutObject and s3:GetObject on $(ar_s3_url "${PREFIX}")/*, and s3:AbortMultipartUpload for packages of multipart_threshold or more (README: Bucket Setup)." ;;
             *) ar_die "Writing $(ar_s3_url "${key}") failed unexpectedly (status ${status})." ;;
         esac
         # A concurrent write that hasn't landed yet: wait and look again.
@@ -362,6 +391,25 @@ probe() {
         ar_die "The If-Match probe of $(ar_s3_url "${key}") failed unexpectedly (status ${status})."
     fi
     echo "${ENDPOINT_URL:-AWS S3} enforces conditional writes (If-None-Match and If-Match)."
+}
+
+# probe_multipart: F-17. Before a package goes up in parts, proves the
+# backend enforces If-None-Match on CompleteMultipartUpload too, which some
+# services that honor it on PutObject don't: a multipart upload of the
+# probe's own bytes onto the probe object, which exists, must fail. If the
+# backend ignores the condition, it rewrites the same bytes.
+probe_multipart() {
+    local key="${PREFIX}/.apk-repo-orb/probe" status=0
+    ar_put_multipart "${key}" "${AR_WORK}/probe" application/octet-stream "${IMMUTABLE_CACHE}" "${AR_MIN_PART}" || status=$?
+    case "${status}" in
+        0) ar_die "${ENDPOINT_URL:-AWS S3} does not enforce If-None-Match on CompleteMultipartUpload; refusing to publish packages of multipart_threshold or more." \
+            "A multipart upload onto $(ar_s3_url "${key}"), which exists, succeeded, so a package uploaded in parts could be overwritten." ;;
+        "${AR_PRECONDITION}" | "${AR_CONFLICT}") ;;
+        "${AR_DENIED}") ar_die "A multipart upload to $(ar_s3_url "${key}") was denied." \
+            "publish needs s3:PutObject and s3:AbortMultipartUpload on $(ar_s3_url "${PREFIX}")/* for packages of multipart_threshold or more (README: Bucket Setup)." ;;
+        *) ar_die "The multipart If-None-Match probe of $(ar_s3_url "${key}") failed unexpectedly (status ${status})." ;;
+    esac
+    echo "${ENDPOINT_URL:-AWS S3} enforces If-None-Match on CompleteMultipartUpload too."
 }
 
 # remote_sidecar ARCH FILE DIR: downloads FILE's sidecar and its signatures
@@ -712,6 +760,9 @@ if [[ "${DRY_RUN}" == "true" ]]; then
     echo "Dry run: nothing will be written."
 else
     probe
+    if [[ "${MULTIPART}" == "true" ]]; then
+        probe_multipart
+    fi
     if [[ "${PUBLISH_PUBLIC_KEY}" == "true" ]]; then
         put_immutable "${PREFIX}/${KEY_NAME}.pub" "${AR_KEYS[${KEY_NAME}]}" application/octet-stream
         if [[ "${PUT_RESULT}" == "different" ]]; then

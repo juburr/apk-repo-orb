@@ -1,0 +1,26 @@
+# The next version of tests/fixtures/melange.yaml's package, for the
+# end-to-end test of a selective pull (T-6): published beside 0.0.1, so the
+# index lists both, while the pull selects 0.0.1 alone. Its script prints
+# another message, so the image shows which version apko installed.
+package:
+  name: apk-repo-hello
+  version: 0.0.2
+  epoch: 0
+  description: Test package for apk-repo-orb
+  copyright:
+    - license: MIT
+
+environment:
+  contents:
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    repositories:
+      - https://packages.wolfi.dev/os
+    packages:
+      - busybox
+
+pipeline:
+  - runs: |
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      printf '#!/bin/sh\necho "hello from apk-repo-orb 0.0.2"\n' > "${{targets.destdir}}/usr/bin/apk-repo-hello"
+      chmod 0755 "${{targets.destdir}}/usr/bin/apk-repo-hello"
