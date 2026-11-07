@@ -105,7 +105,7 @@ Publish from one job, pull into another:
 version: 2.1
 
 orbs:
-  apk-repo: juburr/apk-repo-orb@0.3.0
+  apk-repo: juburr/apk-repo-orb@0.2.0
   apko: juburr/apko-orb@1.2.1
   melange: juburr/melange-orb@1.3.0
 
@@ -195,7 +195,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.APK_PUBLISH_ROLE_ARN }}
           aws-region: us-east-1
-      - uses: juburr/apk-repo-orb/actions/publish@v0.3.0
+      - uses: juburr/apk-repo-orb/actions/publish@v0.2.0
         env:
           APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}
         with:
@@ -305,7 +305,7 @@ Every command writes JSON to `receipt_path` (default `apk-repo-receipt.json`) an
 {
   "schema_version": 1,
   "tool": "apk-repo-orb",
-  "tool_version": "0.3.0",
+  "tool_version": "0.2.0",
   "operation": "publish",
   "dry_run": false,
   "backend": "s3",
@@ -431,14 +431,14 @@ Each command has a GitHub Action of the same name. The actions run the same scri
           role-to-assume: ${{ vars.APK_PULL_ROLE_ARN }}
           aws-region: us-east-1
       - id: pull
-        uses: juburr/apk-repo-orb/actions/pull@v0.3.0
+        uses: juburr/apk-repo-orb/actions/pull@v0.2.0
         with:
           bucket: my-org-apk
           prefix: my-org/os
           keyring: keys
       # pull has verified it already; verify checks a copy offline, such as
       # one a later job received as an artifact.
-      - uses: juburr/apk-repo-orb/actions/verify@v0.3.0
+      - uses: juburr/apk-repo-orb/actions/verify@v0.2.0
         with:
           dir: packages
           keyring: keys
@@ -456,8 +456,8 @@ Each command has a GitHub Action of the same name. The actions run the same scri
 
 How they differ from the orb's commands:
 
-- **Inspecting.** `juburr/apk-repo-orb/actions/inspect@v0.3.0` returns the same `receipt` output, which a later step can read with `jq`, as in [Inspecting](#-inspecting).
-- **Versions.** Reference an action by the repository's release tag, such as `v0.3.0`, the tag the orb is published from, or for the strongest pinning by that tag's commit SHA: `juburr/apk-repo-orb/actions/publish@<sha> # v0.3.0`.
+- **Inspecting.** `juburr/apk-repo-orb/actions/inspect@v0.2.0` returns the same `receipt` output, which a later step can read with `jq`, as in [Inspecting](#-inspecting).
+- **Versions.** Reference an action by the repository's release tag, such as `v0.2.0`, the tag the orb is published from, or for the strongest pinning by that tag's commit SHA: `juburr/apk-repo-orb/actions/publish@<sha> # v0.2.0`.
 - **The signing key.** `signing_key` names an environment variable, as in the orb. Set it on the step from a secret (`env: APK_SIGNING_KEY: ${{ secrets.APK_SIGNING_KEY }}`), so it never appears as an input.
 - **Environment variables.** The orb expands `$NAME` in string parameters with the CircleCI CLI, which GitHub's runners don't have, so the actions take values as they are. Use GitHub's expressions instead.
 - **Runners.** GitHub-hosted `ubuntu-24.04` and `ubuntu-24.04-arm` runners have everything the actions need, and CI runs every action on both.
