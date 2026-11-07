@@ -16,6 +16,10 @@ set -euo pipefail
 #                       (default: this machine's).
 #   PARAM_KEYRING       Public key files (<key>.rsa.pub) and directories of
 #                       them to trust, space-separated. Required.
+#   PARAM_INDEX_SHA256  The SHA-256 each architecture's index must have, as
+#                       a receipt records it: one value for one
+#                       architecture, or <arch>=<sha256> pairs (default:
+#                       none, any index the keyring verifies).
 #   PARAM_RECEIPT_PATH  Where to write the JSON receipt (default
 #                       apk-repo-receipt.json).
 # Environment variables in them are expanded when the CircleCI CLI is on
@@ -44,12 +48,17 @@ trap 'rm -rf "${AR_WORK}"' EXIT
 DIR=$(ar_subst "${PARAM_DIR:-packages}")
 ARCH=$(ar_subst "${PARAM_ARCH:-}")
 KEYRING=$(ar_subst "${PARAM_KEYRING:-}")
+INDEX_SHA256=$(ar_subst "${PARAM_INDEX_SHA256:-}")
 RECEIPT_PATH=$(ar_subst "${PARAM_RECEIPT_PATH:-apk-repo-receipt.json}")
 
 ar_need_tools python3 openssl
 ARCH=$(ar_default_arch "${ARCH}") || exit $?
 ar_arches "${ARCH}"
 ar_check_receipt_path "${RECEIPT_PATH}"
+declare -A PIN_SHA256=()
+for arch in "${AR_ARCHES[@]}"; do
+    PIN_SHA256[${arch}]=$(ar_index_sha256 index_sha256 "${INDEX_SHA256}" "${arch}") || exit $?
+done
 # shellcheck disable=SC2034 # filled and read by the lib
 declare -A AR_KEYS=()
 ar_keyring "${KEYRING}"
@@ -65,10 +74,12 @@ for arch in "${AR_ARCHES[@]}"; do
     if [[ ! -f "${index}" ]]; then
         ar_die "${index} is missing; ${DIR} has no ${arch} repository."
     fi
+    ar_check_pinned_index "${index}" "${PIN_SHA256[${arch}]}" "${index}" \
+        "This isn't the index pinned; it may have been replaced, or pulled without the pin."
     ar_verify_index "${index}" "${arch}" "${AR_WORK}/${arch}"
     ar_verify_packages "${DIR}/${arch}" "${arch}" "${AR_WORK}/${arch}" "${AR_WORK}/receipt/arch/${arch}"
     printf '%s\t%s\n' key "${index}" sha256 "$(ar_sha256 "${index}")" signature ".SIGN.RSA256.${AR_INDEX_KEY}.pub" \
-        > "${AR_WORK}/receipt/arch/${arch}/index.tsv"
+        pinned "$([[ -n "${PIN_SHA256[${arch}]}" ]] && echo true || echo false)" > "${AR_WORK}/receipt/arch/${arch}/index.tsv"
     count=$(wc -l < "${AR_WORK}/${arch}/entries.tsv")
     echo "Verified ${DIR}/${arch}: an index signed with ${AR_INDEX_KEY} and its ${count// /} package(s)."
 done

@@ -79,10 +79,11 @@ jobs:
           openssl version
           aws --version
       - name: Start the S3 server
-        run: bash tests/s3_server.sh apk-repo-test
+        run: bash tests/s3_server.sh apk-repo-test apk-repo-test-versions
       - name: Run the integration tests
         env:
           APK_REPO_BUCKET: apk-repo-test
+          APK_REPO_VERSIONED_BUCKET: apk-repo-test-versions
           RACE_ROUNDS: "20"
         run: bash tests/integration_test.sh
 

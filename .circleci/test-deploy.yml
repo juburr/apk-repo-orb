@@ -125,7 +125,8 @@ jobs:
           command: bash tests/golden_test.sh
   # T-4 and T-5: publish, pull and verify with the real AWS CLI and melange against versitygw,
   # which tests/s3_server.sh first proves answers 412 to failed conditional writes (F-14,
-  # F-15), then 20 rounds of two publishes at once.
+  # F-15), then 20 rounds of two publishes at once. Pinned pulls read an earlier version of
+  # an index from a second, versioned bucket.
   integration-test:
     parameters:
       melange_version:
@@ -139,12 +140,13 @@ jobs:
       - show-tools
       - run:
           name: Start the S3 server
-          command: bash tests/s3_server.sh apk-repo-test
+          command: bash tests/s3_server.sh apk-repo-test apk-repo-test-versions
       - run:
           name: Run the integration tests
           command: bash tests/integration_test.sh
           environment:
             APK_REPO_BUCKET: apk-repo-test
+            APK_REPO_VERSIONED_BUCKET: apk-repo-test-versions
             RACE_ROUNDS: "20"
   # T-6: the orb's commands as a pipeline runs them: melange builds a package, publish uploads
   # it, pull fetches it into a fresh directory, verify checks it, and apko builds an image from

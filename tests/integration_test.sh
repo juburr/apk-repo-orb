@@ -16,6 +16,11 @@
 #                      empty for Amazon S3
 #   APK_REPO_PREFIX    a prefix every scenario's prefix goes under (default
 #                      none), so runs sharing a bucket never meet
+#   APK_REPO_VERSIONED_BUCKET
+#                      a bucket with versioning turned on, for pinned pulls
+#                      of an earlier version of the index (default: none;
+#                      APK_REPO_BUCKET is used, and that part is skipped
+#                      unless it is versioned)
 #   RACE_ROUNDS        rounds of the race test (default 20)
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION or AWS_REGION
 #
@@ -69,6 +74,11 @@ receipt_is() {
     local got
     got=$(python3 -I -c 'import json, sys; r = json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "${CASE}/receipt.json" "$1" 2>&1)
     [[ "${got}" == "$2" ]] || { OUTPUT+=$'\n'"receipt: $1 is ${got}, not $2"; return 1; }
+}
+
+# receipt_value EXPRESSION: prints a Python expression on the receipt as r.
+receipt_value() {
+    python3 -I -c 'import json, sys; r = json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "${CASE}/receipt.json" "$1"
 }
 
 # s3_etag KEY: the object's ETag, or "absent".
@@ -168,6 +178,46 @@ check "verify accepts what pull wrote" succeeded
 run pull arch=x86_64 out_dir=first cache_dir=cache
 run pull arch=x86_64 out_dir=second cache_dir=cache
 check "P-6: a second pull takes the packages from cache_dir" said "0 package(s) downloaded, 2 from the cache"
+
+begin "P-9: pinned reads"
+new_case pinned
+VERSIONED_BUCKET=${APK_REPO_VERSIONED_BUCKET:-${BUCKET}}
+package x86_64 hello 1.0-r0
+run publish allow_create=true bucket="${VERSIONED_BUCKET}"
+check "publishing to ${VERSIONED_BUCKET} succeeds" succeeded
+first_sha256=$(receipt_value 'r["architectures"]["x86_64"]["index"]["sha256"]')
+first_version=$(receipt_value 'r["architectures"]["x86_64"]["index"]["version_id"] or ""')
+package x86_64 world 2.0-r0 more
+run publish packages_dir=more bucket="${VERSIONED_BUCKET}"
+check "and so does a second publish, which replaces the index" succeeded
+current_sha256=$(receipt_value 'r["architectures"]["x86_64"]["index"]["sha256"]')
+current_version=$(receipt_value 'r["architectures"]["x86_64"]["index"]["version_id"] or ""')
+run pull arch=x86_64 out_dir=current bucket="${VERSIONED_BUCKET}" index_sha256="${current_sha256}"
+check "a pull pinned to the current index succeeds" succeeded
+check "recording it as pinned" receipt_is 'r["architectures"]["x86_64"]["index"]["pinned"], r["architectures"]["x86_64"]["index"]["sha256"]' "(True, '${current_sha256}')"
+run pull arch=x86_64 out_dir=stale bucket="${VERSIONED_BUCKET}" index_sha256="${first_sha256}"
+check "a pull pinned to the replaced index, without its version, fails" failed
+check "suggesting index_version_id" said "set index_version_id too"
+check "leaving out_dir empty" [ ! -e "${CASE}/stale/x86_64" ]
+if [[ -n "${first_version}" ]]; then
+    run pull arch=x86_64 out_dir=snapshot bucket="${VERSIONED_BUCKET}" index_sha256="${first_sha256}" \
+        index_version_id="${first_version}"
+    check "with its version (${first_version}), the replaced index is pulled again" succeeded
+    check "with the package it listed" [ -f "${CASE}/snapshot/x86_64/hello-1.0-r0.apk" ]
+    check "and not the one published since" [ ! -e "${CASE}/snapshot/x86_64/world-2.0-r0.apk" ]
+    check "recording that version" receipt_is 'r["architectures"]["x86_64"]["index"]["version_id"]' "${first_version}"
+    run verify arch=x86_64 dir=snapshot index_sha256="${first_sha256}"
+    check "verify accepts the snapshot with the same pin" succeeded
+    run pull arch=x86_64 out_dir=mixed bucket="${VERSIONED_BUCKET}" index_sha256="${first_sha256}" \
+        index_version_id="${current_version}"
+    check "another version than the pinned index's fails" failed
+    check "saying to take both from the same receipt" said "from the same receipt"
+elif [[ -n "${APK_REPO_VERSIONED_BUCKET:-}" ]]; then
+    OUTPUT="The receipt has no version_id."
+    check "APK_REPO_VERSIONED_BUCKET ${VERSIONED_BUCKET} returns version IDs" false
+else
+    echo "  skipped: pulling a replaced index by its version, since ${VERSIONED_BUCKET} isn't versioned."
+fi
 
 begin "U-8, P-4: a prefix with no repository"
 new_case missing

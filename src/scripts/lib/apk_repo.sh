@@ -10,13 +10,18 @@
 # instead of exiting: ar_get_object and ar_put_object return 0, or one of
 # the AR_* codes below.
 
-AR_TOOL_VERSION="0.1.1"
+AR_TOOL_VERSION="0.2.0"
 
 # The same patterns as apk_repo.py; tests/wiring_test.sh checks that.
 AR_NAME_RE='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
 AR_VERSION_RE='^[0-9A-Za-z._+~-]+-r[0-9]+$'
 AR_KEY_RE='^[A-Za-z0-9][A-Za-z0-9._-]*\.rsa$'
 AR_SEGMENT_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+# A pinned index's SHA-256, in hex, and an S3 version ID: opaque and
+# URL-safe, at most 1,024 bytes ("null" for an object written before
+# versioning was turned on), which ar_index_version_id checks.
+AR_SHA256_RE='^[0-9a-fA-F]{64}$'
+AR_VERSION_ID_RE='^[A-Za-z0-9._+/=-]+$'
 
 # Status codes of ar_get_object and ar_put_object.
 AR_ABSENT=3
@@ -179,6 +184,96 @@ ar_default_arch() {
     else
         ar_machine_arch
     fi
+}
+
+# ar_arch_value NAME VALUE ARCH REGEX WHAT: prints ARCH's value from the
+# parameter NAME, given as one value when AR_ARCHES has one architecture, or
+# as space-separated <arch>=<value> pairs, one for each architecture in
+# AR_ARCHES and no other. An empty VALUE prints nothing. Every value must
+# match REGEX; WHAT says what that is, for the error. Run it as
+# X=$(ar_arch_value ...) || exit $?, like ar_default_arch.
+ar_arch_value() {
+    local name=$1 value=$2 want=$3 regex=$4 what=$5 token arch found=""
+    local -a tokens=()
+    local -A seen=()
+    # Split on spaces and newlines, never expanding a * or [ in it.
+    read -r -d '' -a tokens <<< "${value}" || true
+    if [[ ${#tokens[@]} -eq 0 ]]; then
+        return 0
+    fi
+    if ! ar_match "${tokens[0]}" '^(x86_64|aarch64)='; then
+        if [[ ${#tokens[@]} -ne 1 ]]; then
+            ar_usage "${name} must be one value, or <arch>=<value> pairs such as 'x86_64=... aarch64=...'."
+        fi
+        if [[ ${#AR_ARCHES[@]} -ne 1 ]]; then
+            ar_usage "${name} gives one value for ${#AR_ARCHES[@]} architectures (${AR_ARCHES[*]})." \
+                "Give an <arch>=<value> pair for each, such as '${AR_ARCHES[0]}=... ${AR_ARCHES[1]}=...'."
+        fi
+        if ! ar_match "${tokens[0]}" "${regex}"; then
+            ar_usage "${name} '${tokens[0]}' isn't ${what}."
+        fi
+        printf '%s\n' "${tokens[0]}"
+        return 0
+    fi
+    for token in "${tokens[@]}"; do
+        arch=${token%%=*}
+        if [[ "${token}" != *=* ]] || ! ar_match "${arch}" '^(x86_64|aarch64)$'; then
+            ar_usage "${name} '${token}' must be <arch>=<value>, with x86_64 or aarch64 as <arch>."
+        fi
+        if [[ " ${AR_ARCHES[*]} " != *" ${arch} "* ]]; then
+            ar_usage "${name} gives a value for ${arch}, which arch doesn't list (${AR_ARCHES[*]})."
+        fi
+        if [[ -n "${seen[${arch}]:-}" ]]; then
+            ar_usage "${name} gives ${arch} more than once."
+        fi
+        seen[${arch}]=1
+        if ! ar_match "${token#*=}" "${regex}"; then
+            ar_usage "${name} for ${arch}, '${token#*=}', isn't ${what}."
+        fi
+        if [[ "${arch}" == "${want}" ]]; then
+            found=${token#*=}
+        fi
+    done
+    for arch in "${AR_ARCHES[@]}"; do
+        if [[ -z "${seen[${arch}]:-}" ]]; then
+            ar_usage "${name} gives no value for ${arch}; give one for every architecture, or none."
+        fi
+    done
+    printf '%s\n' "${found}"
+}
+
+# ar_index_sha256 NAME VALUE ARCH and ar_index_version_id NAME VALUE ARCH:
+# ar_arch_value for index_sha256 and index_version_id. A SHA-256 may be in
+# upper case, and prints in lower case, as receipts hold it.
+ar_index_sha256() {
+    local value
+    value=$(ar_arch_value "$1" "$2" "$3" "${AR_SHA256_RE}" \
+        "a SHA-256 in hex (64 characters), such as a receipt's index.sha256") || exit $?
+    printf '%s\n' "${value,,}"
+}
+
+ar_index_version_id() {
+    local value
+    value=$(ar_arch_value "$1" "$2" "$3" "${AR_VERSION_ID_RE}" "an S3 version ID, such as a receipt's index.version_id") || exit $?
+    if (( ${#value} > 1024 )); then
+        ar_usage "$1 for $3 is ${#value} characters; an S3 version ID is at most 1024."
+    fi
+    printf '%s\n' "${value}"
+}
+
+# ar_check_pinned_index FILE PINNED WHAT [HINT...]: the index FILE (WHAT
+# names it) has the SHA-256 PINNED, when PINNED isn't empty; otherwise it
+# fails with the HINT lines. Run it before the index is parsed. It checks as
+# well as the signature, which says who made an index, not which one it is.
+ar_check_pinned_index() {
+    local file=$1 pinned=$2 what=$3 actual
+    shift 3
+    [[ -z "${pinned}" ]] && return 0
+    actual=$(ar_sha256 "${file}")
+    if [[ "${actual}" != "${pinned}" ]]; then
+        ar_die "${what}'s SHA-256 is ${actual}, not the ${pinned} index_sha256 pins." "$@"
+    fi
+    echo "${what}'s SHA-256 is the ${pinned} index_sha256 pins."
 }
 
 # ar_check_prefix VALUE: F-2's prefix rule, matched against the whole value
@@ -459,7 +554,7 @@ ar_aws_status() {
         echo precondition
     elif grep -qE '\((ConditionalRequestConflict|409)\)' "$1"; then
         echo conflict
-    elif grep -qE '\((NoSuchKey|404)\)' "$1"; then
+    elif grep -qE '\((NoSuchKey|NoSuchVersion|404)\)' "$1"; then
         echo absent
     elif grep -qE '\((AccessDenied|403|Forbidden)\)' "$1"; then
         echo denied
@@ -479,15 +574,21 @@ ar_denied_hint() {
         "Grant s3:GetObject on $(ar_s3_url "${1%/*}")/* and s3:ListBucket on the bucket (README: Bucket Setup)."
 }
 
-# ar_get_object KEY OUT: downloads KEY to OUT. Returns 0 (setting AR_ETAG
-# and AR_VERSION_ID), AR_ABSENT or AR_DENIED; any other error is fatal.
+# ar_get_object KEY OUT [VERSION_ID]: downloads KEY to OUT, or that version
+# of it. Returns 0 (setting AR_ETAG and AR_VERSION_ID), AR_ABSENT (no such
+# key or version) or AR_DENIED; any other error is fatal.
 ar_get_object() {
     local key=$1 out=$2 status result err kind
+    local -a version=()
+    # --version-id=VALUE, so a version ID starting with - isn't an option.
+    if [[ -n "${3:-}" ]]; then
+        version=("--version-id=$3")
+    fi
     # Its own error file, since ar_get_objects runs several at once.
     err=$(mktemp "${AR_WORK}/aws.XXXXXX")
     status=0
     result=$(aws s3api get-object ${AR_AWS_OPTIONS[@]+"${AR_AWS_OPTIONS[@]}"} --bucket "${AR_BUCKET}" --key "${key}" \
-        --query '[ETag, VersionId]' --output text "${out}" 2> "${err}") || status=$?
+        ${version[@]+"${version[@]}"} --query '[ETag, VersionId]' --output text "${out}" 2> "${err}") || status=$?
     if [[ "${status}" -eq 0 ]]; then
         rm -f -- "${err}"
         AR_ETAG=${result%%$'\t'*}
@@ -502,7 +603,7 @@ ar_get_object() {
         denied) rm -f -- "${err}"; return "${AR_DENIED}" ;;
     esac
     cat "${err}" >&2
-    ar_die "Couldn't read $(ar_s3_url "${key}"): the AWS CLI's GetObject exited ${status}, with the message above."
+    ar_die "Couldn't read $(ar_s3_url "${key}")${3:+ version $3}: the AWS CLI's GetObject exited ${status}, with the message above."
 }
 
 # ar_get_objects LIST: downloads every "KEY<TAB>OUT<TAB>STATUS" line of LIST,

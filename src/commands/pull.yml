@@ -70,6 +70,26 @@ parameters:
       and new packages are added to it; save and restore it with
       save_cache and restore_cache. Empty (the default) caches nothing.
       Environment variables are expanded.
+  index_sha256:
+    type: string
+    default: ""
+    description: >
+      The SHA-256 the index must have, to pull one snapshot of the
+      repository again: the index.sha256 of an earlier receipt. One value
+      for one architecture, or space-separated <arch>=<sha256> pairs, one
+      for each in arch. An index with other bytes fails the pull before
+      it is read; the keyring must still verify it. Packages are never
+      replaced, so the index fixes them too. Empty (the default) pulls the
+      current index. Environment variables are expanded.
+  index_version_id:
+    type: string
+    default: ""
+    description: >
+      Which version of the index to read in a versioned bucket: the
+      index.version_id of the receipt index_sha256 comes from, in the same
+      forms. It needs index_sha256, and s3:GetObjectVersion. Without it, a
+      pinned pull fails once the index has changed. Empty (the default)
+      reads the current version. Environment variables are expanded.
   receipt_path:
     type: string
     default: apk-repo-receipt.json
@@ -85,6 +105,8 @@ steps:
         PARAM_BUCKET: << parameters.bucket >>
         PARAM_CACHE_DIR: << parameters.cache_dir >>
         PARAM_ENDPOINT_URL: << parameters.endpoint_url >>
+        PARAM_INDEX_SHA256: << parameters.index_sha256 >>
+        PARAM_INDEX_VERSION_ID: << parameters.index_version_id >>
         PARAM_KEYRING: << parameters.keyring >>
         PARAM_OUT_DIR: << parameters.out_dir >>
         PARAM_PREFIX: << parameters.prefix >>

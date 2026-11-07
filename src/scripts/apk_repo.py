@@ -400,6 +400,9 @@ def command_receipt(out, workdir):
                 for row in read_tsv(os.path.join(directory, "packages.tsv"))
             ],
         }
+        if operation != "publish":
+            # pull and verify: whether index_sha256 pinned the index.
+            result["index"]["pinned"] = index.get("pinned") == "true"
         if operation == "publish":
             result["published"] = read_lines(os.path.join(directory, "published"))
             result["skipped_identical"] = read_lines(os.path.join(directory, "skipped_identical"))
