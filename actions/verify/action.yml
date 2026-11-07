@@ -38,6 +38,14 @@ inputs:
       with other bytes fails before it is read. Empty (the default) checks
       only that the keyring verifies it. Environment variables are
       expanded.
+  packages:
+    default: ""
+    description: >
+      Verify only these packages, as pull's packages parameter selected
+      them: <name>=<version> entries separated by spaces or newlines, each
+      listed in the index. Packages the index lists but this doesn't are
+      neither required nor checked. Empty (the default) requires and checks
+      every package the index lists. Environment variables are expanded.
   receipt_path:
     default: apk-repo-receipt.json
     description: >
@@ -61,6 +69,7 @@ runs:
         PARAM_DIR: ${{ inputs.dir }}
         PARAM_INDEX_SHA256: ${{ inputs.index_sha256 }}
         PARAM_KEYRING: ${{ inputs.keyring }}
+        PARAM_PACKAGES: ${{ inputs.packages }}
         PARAM_RECEIPT_PATH: ${{ inputs.receipt_path }}
       run: >-
         bash "${GITHUB_ACTION_PATH}/../run_script.sh" "${GITHUB_ACTION_PATH}/../../src/scripts/verify.sh"

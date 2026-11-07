@@ -41,7 +41,9 @@ Commands:
       Writes the JSON receipt from the files the scripts left in WORKDIR
       (meta.tsv, and arch/<arch>/index.tsv, packages.tsv, published,
       skipped_identical, attempts), through a temporary file it renames.
-      An index.tsv with "missing true" (inspect's allow_missing) makes the
+      A selection file (pull's and verify's packages) becomes the
+      architecture's selection, null without one. An index.tsv with
+      "missing true" (inspect's allow_missing) makes the
       architecture's index null, and an empty SHA-256 in packages.tsv
       (inspect reads no sidecar) a null one.
 
@@ -407,6 +409,10 @@ def command_receipt(out, workdir):
         if operation != "publish":
             # pull, verify and inspect: whether index_sha256 pinned the index.
             result["index"]["pinned"] = index.get("pinned") == "true"
+        if operation in ("pull", "verify"):
+            # The packages parameter's entries, or null for every package.
+            selection = os.path.join(directory, "selection")
+            result["selection"] = read_lines(selection) if os.path.exists(selection) else None
         if index.get("missing") == "true":
             # inspect with allow_missing: no repository for this arch yet.
             result["index"] = None

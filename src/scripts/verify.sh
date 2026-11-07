@@ -20,6 +20,9 @@ set -euo pipefail
 #                       a receipt records it: one value for one
 #                       architecture, or <arch>=<sha256> pairs (default:
 #                       none, any index the keyring verifies).
+#   PARAM_PACKAGES      Only these packages, as <name>=<version> entries
+#                       separated by spaces, each listed in the index
+#                       (default: none, every package the index lists).
 #   PARAM_RECEIPT_PATH  Where to write the JSON receipt (default
 #                       apk-repo-receipt.json).
 # Environment variables in them are expanded when the CircleCI CLI is on
@@ -49,6 +52,7 @@ DIR=$(ar_subst "${PARAM_DIR:-packages}")
 ARCH=$(ar_subst "${PARAM_ARCH:-}")
 KEYRING=$(ar_subst "${PARAM_KEYRING:-}")
 INDEX_SHA256=$(ar_subst "${PARAM_INDEX_SHA256:-}")
+PACKAGES=$(ar_subst "${PARAM_PACKAGES:-}")
 RECEIPT_PATH=$(ar_subst "${PARAM_RECEIPT_PATH:-apk-repo-receipt.json}")
 
 ar_need_tools python3 openssl
@@ -58,6 +62,7 @@ ar_check_receipt_path "${RECEIPT_PATH}"
 # shellcheck disable=SC2034 # filled and read by the lib
 declare -A AR_PIN_SHA256=() AR_PIN_VERSION_ID=()
 ar_index_pins "${INDEX_SHA256}" ""
+ar_selection "${PACKAGES}"
 # shellcheck disable=SC2034 # filled and read by the lib
 declare -A AR_KEYS=()
 ar_keyring "${KEYRING}"
@@ -76,10 +81,20 @@ for arch in "${AR_ARCHES[@]}"; do
     ar_check_pinned_index "${index}" "${AR_PIN_SHA256[${arch}]}" "${index}" \
         "This isn't the index pinned; it may have been replaced, or pulled without the pin."
     ar_verify_index "${index}" "${arch}" "${AR_WORK}/${arch}"
+    # What a selective pull wrote: the whole index, and only these packages.
+    ar_select_entries "${AR_WORK}/${arch}" "${index}"
+    mkdir -p "${AR_WORK}/receipt/arch/${arch}"
+    if [[ ${#AR_SELECTION[@]} -gt 0 ]]; then
+        printf '%s\n' "${AR_SELECTION[@]}" > "${AR_WORK}/receipt/arch/${arch}/selection"
+    fi
     ar_verify_packages "${DIR}/${arch}" "${arch}" "${AR_WORK}/${arch}" "${AR_WORK}/receipt/arch/${arch}"
     printf '%s\t%s\n' key "${index}" sha256 "$(ar_sha256 "${index}")" signature ".SIGN.RSA256.${AR_INDEX_KEY}.pub" \
         pinned "$([[ -n "${AR_PIN_SHA256[${arch}]}" ]] && echo true || echo false)" > "${AR_WORK}/receipt/arch/${arch}/index.tsv"
     count=$(wc -l < "${AR_WORK}/${arch}/entries.tsv")
-    echo "Verified ${DIR}/${arch}: an index signed with ${AR_INDEX_KEY} and its ${count// /} package(s)."
+    if [[ ${#AR_SELECTION[@]} -gt 0 ]]; then
+        echo "Verified ${DIR}/${arch}: an index signed with ${AR_INDEX_KEY} and the ${count// /} package(s) packages selects."
+    else
+        echo "Verified ${DIR}/${arch}: an index signed with ${AR_INDEX_KEY} and its ${count// /} package(s)."
+    fi
 done
 ar_write_receipt "${RECEIPT_PATH}"

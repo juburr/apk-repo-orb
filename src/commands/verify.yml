@@ -37,6 +37,15 @@ parameters:
       with other bytes fails before it is read. Empty (the default) checks
       only that the keyring verifies it. Environment variables are
       expanded.
+  packages:
+    type: string
+    default: ""
+    description: >
+      Verify only these packages, as pull's packages parameter selected
+      them: <name>=<version> entries separated by spaces or newlines, each
+      listed in the index. Packages the index lists but this doesn't are
+      neither required nor checked. Empty (the default) requires and checks
+      every package the index lists. Environment variables are expanded.
   receipt_path:
     type: string
     default: apk-repo-receipt.json
@@ -51,6 +60,7 @@ steps:
         PARAM_DIR: << parameters.dir >>
         PARAM_INDEX_SHA256: << parameters.index_sha256 >>
         PARAM_KEYRING: << parameters.keyring >>
+        PARAM_PACKAGES: << parameters.packages >>
         PARAM_RECEIPT_PATH: << parameters.receipt_path >>
         SCRIPT_APK_REPO_LIB: << include(scripts/lib/apk_repo.sh) >>
         SCRIPT_APK_REPO_PY: << include(scripts/apk_repo.py) >>
