@@ -133,6 +133,17 @@ jobs:
         run: |
           mkdir -p keyring
           mv apk-repo-test.rsa.pub keyring/
+          # Unlike a secret, a value written to GITHUB_ENV isn't masked, and
+          # every later step lists its env in the log. GitHub masks a
+          # multi-line value one line at a time, so register each line of the
+          # key (the BEGIN and END lines aren't secret), even for this
+          # throwaway key, so the workflow never shows a pattern that leaks a
+          # real one.
+          while IFS= read -r line; do
+            if [[ -n "${line}" && "${line}" != -----* ]]; then
+              echo "::add-mask::${line}"
+            fi
+          done < apk-repo-test.rsa
           delimiter="ghadelimiter_$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
           printf 'APK_SIGNING_KEY<<%s\n%s\n%s\n' "${delimiter}" "$(cat apk-repo-test.rsa)" "${delimiter}" >> "${GITHUB_ENV}"
           rm apk-repo-test.rsa
