@@ -43,6 +43,23 @@ jobs:
             bash "${test}"
           done
 
+  # The offline command tests with bash 4.0 and 4.3 first on the PATH, in the
+  # official bash images: the orb supports bash 4.0 and newer.
+  old-bash:
+    strategy:
+      fail-fast: false
+      matrix:
+        bash: ["4.0", "4.3"]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the offline command tests with an old bash
+        env:
+          BASH_TO_TEST: ${{ matrix.bash }}
+        run: bash tests/old_bash_test.sh "${BASH_TO_TEST}"
+
   # T-3: verify accepts what real melange writes and refuses a one-byte change
   # in each signed segment.
   golden:

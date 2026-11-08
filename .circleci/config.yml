@@ -33,6 +33,20 @@ jobs:
       - run:
           name: Run wiring test
           command: bash tests/wiring_test.sh
+  # The offline command tests with an old bash first on the PATH, in the official bash image
+  # (tests/old_bash_test.sh): the orb supports bash 4.0 and newer.
+  test-commands-old-bash:
+    parameters:
+      version:
+        type: string
+    machine:
+      image: ubuntu-2404:current
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Run the offline command tests with bash << parameters.version >>
+          command: bash tests/old_bash_test.sh << parameters.version >>
   test-env-subst:
     docker:
       - image: cimg/base:current
@@ -65,6 +79,11 @@ workflows:
             parameters:
               image: ["cimg/base:current", "cimg/python:3.8"]
           filters: *filters
+      - test-commands-old-bash:
+          matrix:
+            parameters:
+              version: ["4.0", "4.3"]
+          filters: *filters
       - test-env-subst:
           filters: *filters
       - test-actions:
@@ -83,5 +102,5 @@ workflows:
           pipeline_number: << pipeline.number >>
           vcs_type: << pipeline.project.type >>
           orb_name: apk-repo-orb
-          requires: [test-commands, test-env-subst, test-actions, orb-tools/lint, orb-tools/pack, orb-tools/review, shellcheck/check]
+          requires: [test-commands, test-commands-old-bash, test-env-subst, test-actions, orb-tools/lint, orb-tools/pack, orb-tools/review, shellcheck/check]
           filters: *filters
