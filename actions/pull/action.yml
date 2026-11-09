@@ -27,14 +27,12 @@ inputs:
     description: >
       The repository's key prefix in the bucket, such as my-org/os, with no
       leading or trailing /. Its packages are at <prefix>/<arch>/.
-      Environment variables are expanded.
     required: true
   endpoint_url:
     default: ""
     description: >
       An S3-compatible service's endpoint, passed as --endpoint-url. It must
       be https://, or http:// to localhost. Empty (the default) is AWS.
-      Environment variables are expanded.
   region:
     default: ""
     description: >
@@ -58,7 +56,7 @@ inputs:
     default: packages
     description: >
       Where to put the repository. Each out_dir/<arch> must not exist yet,
-      or be empty. Environment variables are expanded.
+      or be empty.
   cache_dir:
     default: ""
     description: >
@@ -66,7 +64,6 @@ inputs:
       SHA-256 matches its signed sidecar is used instead of downloading it,
       and new packages are added to it; save and restore it with
       save_cache and restore_cache. Empty (the default) caches nothing.
-      Environment variables are expanded.
   index_sha256:
     default: ""
     description: >
@@ -76,7 +73,7 @@ inputs:
       for each in arch. An index with other bytes fails the pull before
       it is read; the keyring must still verify it. Packages are never
       replaced, so the index fixes them too. Empty (the default) pulls the
-      current index. Environment variables are expanded.
+      current index.
   index_version_id:
     default: ""
     description: >
@@ -84,7 +81,7 @@ inputs:
       index.version_id of the receipt index_sha256 comes from, in the same
       forms. It needs index_sha256, and s3:GetObjectVersion. Without it, a
       pinned pull fails once the index has changed. Empty (the default)
-      reads the current version. Environment variables are expanded.
+      reads the current version.
   packages:
     default: ""
     description: >
@@ -95,12 +92,12 @@ inputs:
       package. out_dir gets the whole signed index and only these packages,
       so pin apko to exactly these versions (an apko lock file, or
       name=version in its packages). Empty (the default) pulls every
-      package. Environment variables are expanded.
+      package.
   receipt_path:
     default: apk-repo-receipt.json
     description: >
       Where to write the JSON receipt of what was pulled. Its absolute path
-      is exported as APK_REPO_RECEIPT. Environment variables are expanded.
+      is exported as APK_REPO_RECEIPT.
 
 outputs:
   receipt:

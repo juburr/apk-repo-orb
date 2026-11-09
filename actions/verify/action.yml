@@ -15,7 +15,7 @@ inputs:
     default: packages
     description: >
       The repository directory, holding <arch>/APKINDEX.tar.gz and the
-      packages, such as pull's out_dir. Environment variables are expanded.
+      packages, such as pull's out_dir.
   arch:
     default: ""
     description: >
@@ -27,7 +27,6 @@ inputs:
       Public keys to trust, space-separated: files named <key>.rsa.pub, or
       directories whose *.rsa.pub files are all trusted, from your
       checkout. A key is never taken from the repository itself.
-      Environment variables are expanded.
     required: true
   index_sha256:
     default: ""
@@ -45,12 +44,12 @@ inputs:
       them: <name>=<version> entries separated by spaces or newlines, each
       listed in the index. Packages the index lists but this doesn't are
       neither required nor checked. Empty (the default) requires and checks
-      every package the index lists. Environment variables are expanded.
+      every package the index lists.
   receipt_path:
     default: apk-repo-receipt.json
     description: >
       Where to write the JSON receipt of what was verified. Its absolute path
-      is exported as APK_REPO_RECEIPT. Environment variables are expanded.
+      is exported as APK_REPO_RECEIPT.
 
 outputs:
   receipt:

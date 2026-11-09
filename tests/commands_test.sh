@@ -429,11 +429,12 @@ run publish
 check "a 409 ConditionalRequestConflict retries too" succeeded
 echo "PutObject .*/APKINDEX.tar.gz 412" > "${CASE}/rules"
 package x86_64 fourth 4.0-r0
+: > "${CASE}/aws.log"
 run publish PARAM_MAX_ATTEMPTS=3
 check "max_attempts exhausted fails" failed
 check "saying so" said "gave up after 3 attempts"
 check "U-15: naming the architecture" said "Publishing failed for x86_64"
-check "after exactly 3 index writes" [ "$(grep -c '^PutObject test/os/x86_64/APKINDEX.tar.gz' "${CASE}/aws.log")" -ge 3 ]
+check "after exactly 3 index writes" [ "$(grep -c '^PutObject test/os/x86_64/APKINDEX.tar.gz' "${CASE}/aws.log")" -eq 3 ]
 
 begin "T-5: concurrent publishes (offline)"
 new_case
@@ -659,7 +660,9 @@ echo 'CompleteMultipartUpload big-1\.0-r0\.apk$ 409 1' > "${CASE}/rules"
 : > "${CASE}/aws.log"
 publish_new "${MULTIPART[@]}"
 check "U-10: a 409 on CompleteMultipartUpload is retried" succeeded
-check "with a new upload, the first one aborted" [ "$(grep -c '^CreateMultipartUpload test/os/x86_64/big' "${CASE}/aws.log")" -eq 2 ] && logged '^AbortMultipartUpload test/os/x86_64/big' && [ "$(open_uploads)" -eq 0 ]
+check "with a new upload" [ "$(grep -c '^CreateMultipartUpload test/os/x86_64/big' "${CASE}/aws.log")" -eq 2 ]
+check "the first one aborted" logged '^AbortMultipartUpload test/os/x86_64/big'
+check "leaving none open" [ "$(open_uploads)" -eq 0 ]
 
 new_case
 big_package x86_64 big 1.0-r0
@@ -929,7 +932,8 @@ publish_new PARAM_ARCH="x86_64 aarch64"
 run pull PARAM_OUT_DIR=some PARAM_PACKAGES="hello=1.0.0-r0 world=2.1-r3"
 check "succeeds" succeeded
 check "saying how many it selected" said "Selected 2 of the 3 package(s) s3://bucket/test/os/x86_64/APKINDEX.tar.gz lists."
-check "pulling the selected packages" exists "${CASE}/some/x86_64/hello-1.0.0-r0.apk" && exists "${CASE}/some/x86_64/world-2.1-r3.apk"
+check "pulling the selected packages" exists "${CASE}/some/x86_64/hello-1.0.0-r0.apk"
+check "all of them" exists "${CASE}/some/x86_64/world-2.1-r3.apk"
 check "and not the others" absent "${CASE}/some/x86_64/hello-1.1.0-r0.apk"
 check "nor their sidecars" absent "${CASE}/some/x86_64/hello-1.1.0-r0.apk.sha256"
 check "with the whole signed index, as it is" cmp -s "${CASE}/some/x86_64/APKINDEX.tar.gz" "$(s3 test/os/x86_64/APKINDEX.tar.gz)"
@@ -1007,7 +1011,8 @@ first_x86=${first_x86%% *}
 : > "${CASE}/aws.log"
 FAKE_S3_VERSIONING=1 run inspect PARAM_ARCH="x86_64 aarch64"
 check "succeeds for both architectures" succeeded
-check "I-1: reading each architecture's index" logged '^GetObject test/os/x86_64/APKINDEX.tar.gz ' && logged '^GetObject test/os/aarch64/APKINDEX.tar.gz '
+check "I-1: reading each architecture's index" logged '^GetObject test/os/x86_64/APKINDEX.tar.gz '
+check "both of them" logged '^GetObject test/os/aarch64/APKINDEX.tar.gz '
 check "and nothing else" [ "$(grep -c . "${CASE}/aws.log")" -eq 2 ]
 check "I-1: writing nothing to the bucket" not_logged '^PutObject'
 check "or to the working directory but the receipt" [ -z "$(find "${CASE}" -mindepth 1 -maxdepth 1 ! -name s3 ! -name tmp ! -name bash_env \

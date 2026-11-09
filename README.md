@@ -148,10 +148,10 @@ workflows:
   build:
     jobs:
       - publish:
-          context: apk-publishing # APK_SIGNING_KEY and AWS access
+          context: apk-publishing # APK_SIGNING_KEY and AWS write access
       - image:
           requires: [publish]
-          context: apk-publishing
+          context: apk-pulling # AWS read access only, no signing key
 ```
 
 `apko.yaml` trusts the same key and installs your package from the pulled directory:
@@ -236,7 +236,7 @@ The bucket holds a standard APK v2 repository that `apk` and apko understand, pl
 3. **Probes the bucket.** It writes `<prefix>/.apk-repo-orb/probe` with fixed bytes and `If-None-Match: *`, writes it again (which must fail with 412), and writes it with an `If-Match` that can't match (which must fail with 412 too). If either succeeds, the bucket ignores conditional writes and `publish` stops: `ERROR: <endpoint> does not enforce S3 conditional writes; refusing to publish`. When a package will go up in parts, it also completes a multipart upload of the same bytes onto the probe object with `If-None-Match: *`, which must fail with 412 as well, since some services honor the condition on `PutObject` but not on `CompleteMultipartUpload`. The writes never change the object.
 4. **Reads the index** and verifies it with the keyring. A missing index is an error unless `allow_create` is set, so a mistyped prefix never starts a new repository. Access denied (403) is always an error, never "no repository".
 5. **Sorts the packages.** A package the index doesn't list is new. One it lists must be the same package: the same bytes, or the same control and data segments signed differently. Anything else fails: published packages never change, so publish a new build under a new version or epoch (`-r<N>`).
-6. **Uploads the new packages and sidecars** with `If-None-Match: *`, before the index, so no index ever lists a package that isn't there. A package of `multipart_threshold` (default 5 GB, the most a single `PutObject` takes) or more goes up as a multipart upload in parts of `multipart_chunksize` (default 64 MB), 8 at a time, each with its SHA-256 when `s3_checksums` is on, and the upload is completed with `If-None-Match: *` too, so it can't replace an object either. A failed upload is aborted. Each part is cut into a temporary file of its own, so a publish needs about 8 parts' worth of free disk.
+6. **Uploads the new packages and sidecars** with `If-None-Match: *`, before the index, so no index ever lists a package that isn't there. A package of `multipart_threshold` (default 5 GB, the most a single `PutObject` takes) or more goes up as a multipart upload in parts of `multipart_chunksize` (default 64 MB), 8 at a time, each with its SHA-256 when `s3_checksums` is on, and the upload is completed with `If-None-Match: *` too, so it can't replace an object either. A failed upload is aborted. Each part is cut into a temporary file of its own, so a publish needs about 8 parts' worth of free disk: 8 × `multipart_chunksize`, or more for a package that would need more than 10,000 parts, whose parts are larger.
 7. **Merges and uploads the index.** `melange index --merge` writes the new index, signed with the production key. `publish` checks that it lists exactly the old entries, unchanged, plus the new ones, then uploads it with `If-Match` on the ETag read in step 4 (or `If-None-Match: *` when creating). On 412 or 409, another publish got there first: it waits (with jittered backoff), reads the index again and merges again, up to `max_attempts` times.
 
 Architectures are published independently: one that fails doesn't undo another, and the step fails naming the ones that did. `dry_run` does everything but write, and reports what it would publish. The receipt (below) is written only when everything succeeds.
@@ -355,7 +355,7 @@ Every command writes JSON to `receipt_path` (default `apk-repo-receipt.json`) an
 }
 ```
 
-`packages` lists every package in the resulting (publish), verified (pull, verify) or inspected (inspect) index; `inspect` reads no sidecar, so its packages' `sha256` is `null`, and with `allow_missing` an architecture without an index has `"index": null` and no packages. `published`, `skipped_identical` and `attempts` appear for `publish` only, `index.pinned` (`true` when `index_sha256` pinned the index) for `pull`, `verify` and `inspect` only, and `selection` (the `packages` entries, or `null` for every package) for `pull` and `verify` only. `index.sha256` and `index.version_id` are the values a later pull pins (see [Pinned reads](#pinned-reads)). `version_id` is set in a versioned bucket. For `verify`, `index.key` is the local path, and `backend`, `endpoint_url`, `bucket`, `prefix` and `key_name` are `null`. Receipts never hold credentials or key material.
+`packages` lists every package in the resulting (publish), verified (pull, verify) or inspected (inspect) index, or, for a `pull` or `verify` with `packages` set, only the selected ones; `inspect` reads no sidecar, so its packages' `sha256` is `null`, and with `allow_missing` an architecture without an index has `"index": null` and no packages. `published`, `skipped_identical` and `attempts` appear for `publish` only, `index.pinned` (`true` when `index_sha256` pinned the index) for `pull`, `verify` and `inspect` only, and `selection` (the `packages` entries, or `null` for every package) for `pull` and `verify` only. `index.sha256` and `index.version_id` are the values a later pull pins (see [Pinned reads](#pinned-reads)). `version_id` is set in a versioned bucket. For `verify`, `index.key` is the local path, and `backend`, `endpoint_url`, `bucket`, `prefix` and `key_name` are `null`. Receipts never hold credentials or key material.
 
 ## 🧰 CircleCI Commands
 
@@ -440,7 +440,7 @@ Lists what the repository's index holds, verified, without downloading any packa
 
 ## ⚡ GitHub Actions
 
-Each command has a GitHub Action of the same name. The actions run the same scripts as the orb and take the same inputs with the same defaults, and each returns a `receipt` output: the receipt's absolute path.
+Each command has a GitHub Action of the same name. The actions run the same scripts as the orb and take the same inputs with the same defaults, and each returns a `receipt` output: the receipt's absolute path. An input is taken as given: the orb expands `$VARIABLES` in a parameter with the CircleCI CLI, which GitHub's runners don't have, so use `${{ env.NAME }}` or `${{ vars.NAME }}` in an input instead.
 
 | Action | Orb command |
 | --- | --- |
@@ -659,7 +659,7 @@ environment:
 
 - **Trust only your keyring.** Signatures are checked against public keys from your checkout. A key from the bucket is never trusted, not even the one `publish_public_key` uploads.
 - **Verify before use.** `publish` verifies the bucket's index, and the sidecar of every package the new index lists, before it writes the index; `pull` verifies everything before anything reaches `out_dir`, and refuses to download more of any object than it can be. An index's contents are only read once its signature verifies. Only RSA-SHA256 signatures by RSA keys are accepted. A sidecar needs one signature by a keyring key that verifies; one by another keyring key that doesn't is reported with a warning, since an immutable stray signature must not make a package unreadable for good.
-- **Nothing is deleted or overwritten.** The orb's only write is `aws s3api put-object` with `If-None-Match` or `If-Match`; it never calls `aws s3 cp`/`sync`, `delete-object` or any other mutating API. A test fails the build if one appears.
+- **Nothing is deleted or overwritten.** The orb writes with `aws s3api put-object`, with `If-None-Match` or `If-Match`, and, for a package of `multipart_threshold` or more, a multipart upload (`create-multipart-upload`, `upload-part`, and `complete-multipart-upload`, always with `If-None-Match: *`, or `abort-multipart-upload` after a failure). It never calls `aws s3 cp`/`sync`, `delete-object` or any other mutating API. A test fails the build if one appears.
 - **The signing key.** It is passed only as the name of an environment variable. `publish` reads it first, before it runs any tool, and unsets the variable at once, so nothing it runs (the CircleCI CLI, the AWS CLI, python3, openssl, melange) inherits it. It writes the key to a private file (mode 0600, in a directory created with mode 0700) that the step removes when it ends, even after a failure. It is never logged, put on a command line or written to a receipt, and scripts never enable xtrace. An encrypted key fails at once rather than prompting. On GitHub Actions, the shared `actions/run_script.sh` also snapshots the step's environment, key included, into its own private temporary directory to find what the script exported, and removes it when the step ends.
 - **Untrusted archives.** Indexes and packages are parsed in memory with size limits; no path from an archive is ever written to disk.
 - **Least privilege.** No `sudo`, no AWS credential parameters (the CLI's standard chain, ideally [OIDC](#oidc-no-stored-aws-keys)), and no network access beyond the S3 endpoint and AWS STS.
@@ -689,7 +689,7 @@ Linux on `x86_64` and `aarch64`, including CircleCI's `arm.medium` machines and 
 | bash 4+, coreutils, GNU tar and gzip | all | |
 | python3 3.8+ (standard library only) | all | Splits and parses the APK archives' gzip segments, which bash can't do robustly, and writes receipts |
 | `openssl` CLI | all | RSA-SHA256 signatures |
-| AWS CLI v2, 2.22.5 or newer | `pull`, `publish` | The first release whose `put-object` takes `--if-match` |
+| AWS CLI v2, 2.22.5 or newer | `pull`, `publish`, `inspect` | The first release whose `put-object` takes `--if-match` |
 | melange 0.61.2 or newer | `publish` | `melange sign` and `melange index`; install it with [melange-orb](https://github.com/juburr/melange-orb) |
 
 The orb installs none of them. CircleCI's `ubuntu-2404` machine images and GitHub's `ubuntu-24.04` runners have all but melange. `cimg/base` has bash, python3 and openssl, so `verify` runs there, but not the AWS CLI: install it in an earlier step (for example with the [`circleci/aws-cli`](https://circleci.com/developer/orbs/orb/circleci/aws-cli) orb) to `pull` or `publish` there. CI runs the commands on amd64 and arm64 machine executors and runners, with melange 0.61.2 and 0.63.1, and the offline tests on `cimg/base` and on Python 3.8.
@@ -700,8 +700,8 @@ Hosts to allow (HTTPS, port 443) on a locked-down or self-hosted runner:
 
 | Host | Needed by | Purpose |
 | --- | --- | --- |
-| `<bucket>.s3.<region>.amazonaws.com`, `s3.<region>.amazonaws.com` | `pull`, `publish` | The bucket, or the host in `endpoint_url` for an S3-compatible service |
-| `sts.<region>.amazonaws.com` or `sts.amazonaws.com` | `pull`, `publish` | Only when the AWS CLI's credentials come from web identity (OIDC) or an assumed role |
+| `<bucket>.s3.<region>.amazonaws.com`, `s3.<region>.amazonaws.com` | `pull`, `publish`, `inspect` | The bucket, or the host in `endpoint_url` for an S3-compatible service |
+| `sts.<region>.amazonaws.com` or `sts.amazonaws.com` | `pull`, `publish`, `inspect` | Only when the AWS CLI's credentials come from web identity (OIDC) or an assumed role |
 
 `verify` needs no network at all, and `melange sign` and `melange index` work offline. The orb sends nothing anywhere else.
 
@@ -712,13 +712,13 @@ This is an unofficial, community-maintained orb, and contributions are welcome! 
 - **Found a bug or have an idea?** [Open an issue](https://github.com/juburr/apk-repo-orb/issues).
 - **Before opening a pull request**, run `yamllint .`, `shellcheck src/scripts/*.sh src/scripts/lib/*.sh actions/*.sh tests/*.sh`, and every offline test: `bash tests/commands_test.sh`, `bash tests/wiring_test.sh`, `bash tests/actions_test.sh`, `bash tests/env_subst_test.sh` and `bash tests/shell_conventions_test.sh`. They need only bash, python3 and openssl: stand-ins replace the AWS CLI (a bucket in a local directory that can answer 403, 404, 409 and 412 or ignore conditions) and melange.
 - **With Docker, melange and the AWS CLI,** run what CI runs against a real server: `bash tests/s3_server.sh apk-repo-test`, then `APK_REPO_BUCKET=apk-repo-test bash tests/integration_test.sh`, and `bash tests/golden_test.sh` for melange's own output. `tests/s3_server.sh` needs `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` set to any test values.
-- **Against Amazon S3,** with credentials the [`publish` policy](#iam-policy-for-publish) allows: `APK_REPO_BUCKET=my-bucket APK_REPO_ENDPOINT= APK_REPO_PREFIX=apk-repo-orb-ci/my-run bash tests/integration_test.sh`. An empty `APK_REPO_ENDPOINT` means Amazon S3, and every scenario writes under `APK_REPO_PREFIX`. The objects stay behind, since nothing here deletes.
+- **Against Amazon S3,** with credentials the [`publish` policy](#iam-policy-for-publish) allows (and `s3:GetObjectVersion`, in a versioned bucket): `APK_REPO_BUCKET=my-bucket APK_REPO_ENDPOINT= APK_REPO_PREFIX=apk-repo-orb-ci/my-run bash tests/integration_test.sh`. An empty `APK_REPO_ENDPOINT` means Amazon S3, and every scenario writes under `APK_REPO_PREFIX`. The objects stay behind, since nothing here deletes.
 
 CI lints and packs the orb and runs ShellCheck and the offline tests. Then it runs the golden tests with real melange, the integration and race tests against versitygw, and an end-to-end build on amd64 and arm64: melange builds a package, `publish` uploads it, `pull` fetches it, `verify` checks it, and apko builds an image from it that must run. One more job runs the integration tests and that build against Amazon S3. A GitHub workflow ([`.github/workflows/actions.yml`](.github/workflows/actions.yml)) runs the same with the GitHub Actions on GitHub's runners.
 
 The Amazon S3 job (`aws-s3-test`) needs a CircleCI context named `s3_apk_test_rw`:
 
-- **Variables:** `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for an IAM user with the [`publish` policy](#iam-policy-for-publish) on the bucket, `AWS_REGION`, and `AWS_S3_BUCKET_NAME`. Without `AWS_S3_BUCKET_NAME` the job passes without testing.
+- **Variables:** `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for an IAM user with the [`publish` policy](#iam-policy-for-publish) on the bucket, plus `s3:GetObjectVersion` for the pinned pulls in a versioned bucket, `AWS_REGION`, and `AWS_S3_BUCKET_NAME`. Without `AWS_S3_BUCKET_NAME` the job passes without testing, except on a tag, where it fails.
 - **Cleanup:** each run writes under its own prefix, `apk-repo-orb-ci/<workflow>-<job>/`, and deletes nothing. Give the bucket a lifecycle rule that expires objects under `apk-repo-orb-ci/` after a day, and, in a versioned bucket, their noncurrent versions too.
 
 ## 🎨 Logo

@@ -4,7 +4,9 @@ description: >
   offline, and builds a multi-architecture image with apko. Both jobs run
   the orb's commands on machine executors, which have the AWS CLI and,
   for melange's docker runner, a Docker daemon. AWS_ROLE_ARN, AWS_REGION
-  and APK_SIGNING_KEY come from the context. The verify step needs no
+  and APK_SIGNING_KEY come from the apk-publishing context; the image job's
+  apk-pulling context has no signing key, and AWS_ROLE_ARN there is a role
+  that can only read the bucket. The verify step needs no
   network; with receipt_path, each step leaves a JSON receipt of exactly
   what it published, pulled or verified, which store_artifacts keeps.
 
@@ -85,4 +87,4 @@ usage:
             context: apk-publishing
         - image:
             requires: [publish]
-            context: apk-publishing
+            context: apk-pulling
