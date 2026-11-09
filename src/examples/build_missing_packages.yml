@@ -4,8 +4,8 @@ description: >
   nothing else, and lists the packages it holds in its receipt. When this
   machine's architecture has my-package 1.2.3-r0 already, the job stops
   there and succeeds; otherwise it builds the package and publishes it.
-  allow_missing lets the first run, before anything is published, see an
-  empty repository. inspect is a hint, not a lock: if another job publishes
+  allow_missing and allow_create let the first run, before anything is
+  published, see and start an empty repository; remove both once it has. inspect is a hint, not a lock: if another job publishes
   the same version first, publish compares the two builds, and fails if
   they differ. The job signs in to AWS with CircleCI's OIDC token, as the
   publish_packages example does.
@@ -33,7 +33,7 @@ usage:
             bucket: my-org-apk
             prefix: my-org/os
             keyring: keys
-            allow_missing: true
+            allow_missing: true # only until the first publish, as allow_create
         - run:
             name: Stop if this version is published already
             command: |
@@ -53,6 +53,8 @@ usage:
             prefix: my-org/os
             keyring: keys
             key_name: my-org-apk.rsa
+            # Only until the first publish: then remove it, so that a missing
+            # index fails rather than starting an empty repository.
             allow_create: true
   workflows:
     build:

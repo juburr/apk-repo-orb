@@ -306,7 +306,8 @@ jobs:
   # itself, with the IAM user and bucket in the s3_apk_test_rw context (AWS_ACCESS_KEY_ID,
   # AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_S3_BUCKET_NAME). Each run writes under its own
   # prefix in apk-repo-orb-ci/, which a lifecycle rule on the bucket expires, since the orb
-  # never deletes. Without AWS_S3_BUCKET_NAME the job stops at its first step and passes.
+  # never deletes. Without AWS_S3_BUCKET_NAME the job stops at its first step and passes,
+  # except on a tag: a release must not be published untested against Amazon S3.
   aws-s3-test:
     executor: machine-amd64
     steps:
@@ -314,6 +315,10 @@ jobs:
           name: Skip without a bucket
           command: |
             if [[ -z "${AWS_S3_BUCKET_NAME:-}" ]]; then
+              if [[ -n "${CIRCLE_TAG:-}" ]]; then
+                echo "ERROR: AWS_S3_BUCKET_NAME isn't set (it comes from the s3_apk_test_rw context), and ${CIRCLE_TAG} can't be released without the Amazon S3 tests." >&2
+                exit 1
+              fi
               echo "AWS_S3_BUCKET_NAME isn't set (it comes from the s3_apk_test_rw context): skipping the Amazon S3 tests."
               circleci-agent step halt
             fi

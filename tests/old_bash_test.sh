@@ -26,9 +26,10 @@ declare -A IMAGES=(
 # python3 and the openssl CLI.
 PACKAGES="python3 openssl coreutils findutils grep sed gawk diffutils"
 
-versions=("$@")
-if [[ ${#versions[@]} -eq 0 ]]; then
-    versions=(4.0 4.3)
+# Bash 4.0 takes an empty "$@" for an unbound variable.
+versions=(4.0 4.3)
+if [[ $# -gt 0 ]]; then
+    versions=("$@")
 fi
 for version in "${versions[@]}"; do
     if [[ -z "${IMAGES[${version}]:-}" ]]; then

@@ -20,6 +20,8 @@
 #     operation but get-object, put-object and the multipart upload's
 #     (create-multipart-upload, upload-part, complete-multipart-upload and
 #     abort-multipart-upload, which removes parts, never an object);
+#   - no test's check chains commands with && or ||, which check would
+#     not see the result of;
 #   - tests/run_command.sh runs each command's own script;
 #   - the version receipts report (AR_TOOL_VERSION) is the one the
 #     examples and the README pin, so a release can't ship with another.
@@ -240,7 +242,13 @@ if ! grep -q 'complete-multipart-upload .*--if-none-match "\*"' src/scripts/lib/
     fail "T-8: lib/apk_repo.sh no longer completes multipart uploads with --if-none-match \"*\""
 fi
 
-# tests/run_command.sh, which test-deploy.yml runs the steps that must fail
+# A test's check runs one command, and fails with it: "check DESCRIPTION A
+# && B" runs B after check returns, and nothing looks at B's status.
+while IFS= read -r problem; do
+    [[ -n "${problem}" ]] && fail "${problem}: a check with && or || in it tests only its first command; split it, or put the test in a function"
+done < <(grep -nE '^[[:space:]]*check [^#]*(&&|\|\|)' tests/*_test.sh || true)
+
+# tests/run_command.sh, which the integration, golden and command tests run the commands through
 # with, picks each command's own script. --name-only stops before running it.
 for yml in src/commands/*.yml; do
     command=${yml##*/}
@@ -256,9 +264,14 @@ tool_version=$(sed -nE 's/^AR_TOOL_VERSION="(.*)"$/\1/p' src/scripts/lib/apk_rep
 if [[ -z "${tool_version}" ]]; then
     fail "lib/apk_repo.sh sets no AR_TOOL_VERSION"
 fi
+# The orb is pinned as @X.Y.Z, and an action, a git tag, as @vX.Y.Z.
 while IFS= read -r pinned; do
-    if [[ "${pinned}" != *"@${tool_version}" && "${pinned}" != *"@v${tool_version}" ]]; then
-        fail "AR_TOOL_VERSION is ${tool_version}, but ${pinned} pins another version"
+    case "${pinned}" in
+        *juburr/apk-repo-orb/actions/*) expected="@v${tool_version}" ;;
+        *) expected="@${tool_version}" ;;
+    esac
+    if [[ "${pinned}" != *"${expected}" ]]; then
+        fail "AR_TOOL_VERSION is ${tool_version}, but ${pinned} doesn't pin ${expected#@}"
     fi
 done < <(grep -oHE 'juburr/apk-repo-orb(/actions/[a-z]+)?@v?[0-9]+\.[0-9]+\.[0-9]+' src/examples/*.yml README.md)
 if ! grep -qE "juburr/apk-repo-orb@${tool_version//./\\.}\$" src/examples/*.yml; then

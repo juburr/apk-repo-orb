@@ -3,9 +3,9 @@
 # Runs a command's script the way the command's step runs it: with every
 # PARAM_ variable set from the command's parameter defaults, overridden by
 # NAME=VALUE arguments, and SCRIPT_APK_REPO_LIB and SCRIPT_APK_REPO_PY set to
-# the shared helpers. test-deploy.yml uses it to check steps that must fail,
-# since a failing orb step would fail the test job itself. It runs in the
-# current directory, as the step does.
+# the shared helpers. The integration, golden and command tests run the
+# commands through it, with the defaults a user gets. It runs in the current
+# directory, as the step does.
 #
 # Usage, from a checkout:
 #   bash tests/run_command.sh [--name-only] COMMAND [NAME=VALUE ...]

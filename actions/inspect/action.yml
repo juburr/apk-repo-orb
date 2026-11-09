@@ -26,14 +26,12 @@ inputs:
     description: >
       The repository's key prefix in the bucket, such as my-org/os, with no
       leading or trailing /. Its packages are at <prefix>/<arch>/.
-      Environment variables are expanded.
     required: true
   endpoint_url:
     default: ""
     description: >
       An S3-compatible service's endpoint, passed as --endpoint-url. It must
       be https://, or http:// to localhost. Empty (the default) is AWS.
-      Environment variables are expanded.
   region:
     default: ""
     description: >
@@ -69,7 +67,7 @@ inputs:
       index.version_id of the receipt index_sha256 comes from, in the same
       forms. It needs index_sha256, and s3:GetObjectVersion. Without it, a
       pinned inspect fails once the index has changed. Empty (the default)
-      reads the current version. Environment variables are expanded.
+      reads the current version.
   allow_missing:
     default: "false"
     description: >

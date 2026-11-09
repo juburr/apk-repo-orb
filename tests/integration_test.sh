@@ -193,7 +193,8 @@ run verify arch="x86_64 aarch64" dir=pulled
 check "verify accepts what pull wrote" succeeded
 run pull arch=x86_64 out_dir=selected packages="world=2.0-r0"
 check "P-10: a selective pull succeeds" succeeded
-check "with only the selected package" [ -f "${CASE}/selected/x86_64/world-2.0-r0.apk" ] && [ ! -e "${CASE}/selected/x86_64/hello-1.0-r0.apk" ]
+check "with the selected package" [ -f "${CASE}/selected/x86_64/world-2.0-r0.apk" ]
+check "and not the other one" [ ! -e "${CASE}/selected/x86_64/hello-1.0-r0.apk" ]
 check "and the whole index" receipt_is 'r["architectures"]["x86_64"]["selection"], [p["file"] for p in r["architectures"]["x86_64"]["packages"]]' "(['world=2.0-r0'], ['world-2.0-r0.apk'])"
 run verify arch=x86_64 dir=selected packages="world=2.0-r0"
 check "V-9: verify accepts it with the same packages" succeeded
@@ -369,7 +370,8 @@ for round in $(seq "${ROUNDS}"); do
     rm -rf "${CASE}/pulled"
     run pull arch=x86_64 out_dir=pulled
     check "round ${round}: pull succeeds" succeeded
-    check "round ${round}: with both packages" [ -f "${CASE}/pulled/x86_64/left${round}-1.0-r0.apk" ] && [ -f "${CASE}/pulled/x86_64/right${round}-1.0-r0.apk" ]
+    check "round ${round}: with the left package" [ -f "${CASE}/pulled/x86_64/left${round}-1.0-r0.apk" ]
+    check "round ${round}: and the right one" [ -f "${CASE}/pulled/x86_64/right${round}-1.0-r0.apk" ]
     run verify arch=x86_64 dir=pulled
     check "round ${round}: verify passes" succeeded
 done

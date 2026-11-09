@@ -28,14 +28,13 @@ inputs:
     description: >
       The repository's key prefix in the bucket, such as my-org/os, with no
       leading or trailing /. Its packages go to <prefix>/<arch>/.
-      Environment variables are expanded.
     required: true
   endpoint_url:
     default: ""
     description: >
       An S3-compatible service's endpoint, passed as --endpoint-url. It must
       be https://, or http:// to localhost, and enforce conditional writes.
-      Empty (the default) is AWS. Environment variables are expanded.
+      Empty (the default) is AWS.
   region:
     default: ""
     description: >
@@ -47,7 +46,6 @@ inputs:
     description: >
       Architectures to publish, space-separated: x86_64 and/or aarch64.
       Empty (the default) is every packages_dir/<arch> that holds packages.
-      Environment variables are expanded.
   keyring:
     description: >
       Public keys to trust, space-separated: files named <key>.rsa.pub, or
@@ -55,7 +53,6 @@ inputs:
       checkout. It must hold <key_name>.pub, which the private key has to
       match, the key of whatever signed the bucket's index, and a key that
       signed each listed package's sidecar, which publish verifies too.
-      Environment variables are expanded.
     required: true
   packages_dir:
     default: packages
@@ -75,7 +72,7 @@ inputs:
     description: >
       The key's name, ending in .rsa, such as my-org-apk.rsa. Signatures are
       named after it (.SIGN.RSA256.<key_name>.pub), and consumers' keyring
-      file must be <key_name>.pub. Environment variables are expanded.
+      file must be <key_name>.pub.
     required: true
   resign:
     default: "true"
@@ -114,7 +111,7 @@ inputs:
       the largest a single PutObject takes, so only a package that can't go
       up in one request uses parts. The first package of this size in a
       publish makes it prove the service enforces If-None-Match on
-      CompleteMultipartUpload. Environment variables are expanded.
+      CompleteMultipartUpload.
   multipart_chunksize:
     default: 64MB
     description: >
@@ -122,7 +119,7 @@ inputs:
       from 5MB to 5GB, such as 64MB. A package that would need more than
       10,000 parts uses larger ones. Parts upload 8 at a time, each from a
       temporary file of its own, so a publish needs about 8 times this much
-      free disk. Environment variables are expanded.
+      free disk.
   dry_run:
     default: "false"
     description: >

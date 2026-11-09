@@ -260,28 +260,13 @@ def main(argv):
         if "--checksum-sha256" in options:
             if base64.b64encode(hashlib.sha256(body).digest()).decode() != options["--checksum-sha256"]:
                 fail(operation, "BadDigest", "The SHA256 you specified did not match the calculated checksum.")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        os.makedirs(os.path.dirname(meta), exist_ok=True)
-        with open(path + ".partial", "wb") as target:
-            target.write(body)
-        os.replace(path + ".partial", path)
-        version = None
-        if os.environ.get("FAKE_S3_VERSIONING") == "1":
-            version = "v%d" % (int(current.get("VersionId", "v0")[1:]) + 1 if current else 1)
-        values = {"ETag": '"%s"' % hashlib.md5(body).hexdigest(), "VersionId": version,
-                  "ContentType": options.get("--content-type"), "CacheControl": options.get("--cache-control"),
-                  "ChecksumSHA256": options.get("--checksum-sha256")}
-        with open(meta, "w") as stream:
-            json.dump(values, stream)
-        if version:
-            os.makedirs(versions, exist_ok=True)
-            with open(os.path.join(versions, version), "wb") as target:
-                target.write(body)
-            with open(os.path.join(versions, version + ".json"), "w") as stream:
-                json.dump(values, stream)
+        values = write_object(path, meta, versions, body, {
+            "ETag": '"%s"' % hashlib.md5(body).hexdigest(),
+            "ContentType": options.get("--content-type"), "CacheControl": options.get("--cache-control"),
+            "ChecksumSHA256": options.get("--checksum-sha256")}, current)
         if status == "landed-412":
             error(operation, "412")
-        output(options, {"ETag": values["ETag"], "VersionId": version})
+        output(options, {"ETag": values["ETag"], "VersionId": values["VersionId"]})
     return 0
 
 
@@ -294,7 +279,8 @@ def write_object(path, meta, versions, body, values, current):
     os.replace(path + ".partial", path)
     version = None
     if os.environ.get("FAKE_S3_VERSIONING") == "1":
-        version = "v%d" % (int(current.get("VersionId", "v0")[1:]) + 1 if current else 1)
+        # An object written before versioning was on has a null VersionId.
+        version = "v%d" % (int((current.get("VersionId") or "v0")[1:]) + 1 if current else 1)
     values = dict(values, VersionId=version)
     with open(meta, "w") as stream:
         json.dump(values, stream)
