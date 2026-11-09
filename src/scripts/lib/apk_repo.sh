@@ -906,12 +906,18 @@ ar_size() {
     unit=${2#"${number}"}
     number=$((10#${number}))
     case "${unit}" in
-        KB) number=$((number * 1024)) ;;
-        MB) number=$((number * 1024 * 1024)) ;;
-        GB) number=$((number * 1024 * 1024 * 1024)) ;;
-        TB) number=$((number * 1024 * 1024 * 1024 * 1024)) ;;
+        KB) unit=1024 ;;
+        MB) unit=$((1024 * 1024)) ;;
+        GB) unit=$((1024 * 1024 * 1024)) ;;
+        TB) unit=$((1024 * 1024 * 1024 * 1024)) ;;
+        *) unit=1 ;;
     esac
-    printf '%s\n' "${number}"
+    # Bash's arithmetic is 64-bit: anything over 2^62 bytes would wrap
+    # around to a size that looks valid, and no size here is near it.
+    if (( number > (1 << 62) / unit )); then
+        ar_usage "$1 '$2' is too large."
+    fi
+    printf '%s\n' "$((number * unit))"
 }
 
 # ar_need_aws_multipart: the AWS CLI's complete-multipart-upload must take
@@ -966,6 +972,11 @@ ar_put_multipart() {
         ar_upload_part "${key}" "${upload}" "${file}" "${part}" "${chunk}" "${dir}" &
         if (( part % AR_PARALLEL == 0 )); then
             wait
+            # A batch with a failed part: the upload is aborted below, so
+            # start no more parts.
+            if ! ar_parts_ok "${dir}" $((part - AR_PARALLEL + 1)) "${part}"; then
+                break
+            fi
         fi
     done
     wait
@@ -1014,6 +1025,14 @@ ar_put_multipart() {
     ar_die "Couldn't complete the multipart upload of $(ar_s3_url "${key}"): the AWS CLI's CompleteMultipartUpload exited ${status}, with the message above."
 }
 
+# ar_parts_ok DIR FIRST LAST: parts FIRST to LAST uploaded (status 0).
+ar_parts_ok() {
+    local part
+    for ((part = $2; part <= $3; part++)); do
+        [[ "$(cat -- "$1/${part}.status" 2> /dev/null)" == "0" ]] || return 1
+    done
+}
+
 # ar_upload_part KEY UPLOAD FILE PART CHUNKSIZE DIR: uploads part PART of
 # FILE (CHUNKSIZE bytes from (PART - 1) * CHUNKSIZE, or what is left), cut
 # into a temporary file of its own and removed after, and writes its ETag
@@ -1032,6 +1051,12 @@ ar_upload_part() {
     fi
     if [[ "${AR_S3_CHECKSUMS:-true}" == "true" ]]; then
         checksum=(--checksum-sha256 "$(openssl dgst -sha256 -binary "${piece}" | base64)")
+        if ! ar_match "${checksum[1]}" '^[A-Za-z0-9+/]{43}=$'; then
+            rm -f -- "${piece}"
+            echo "ERROR: Couldn't compute the SHA-256 of part ${part} of ${file} for S3 to check." >&2
+            echo failed > "${dir}/${part}.status"
+            return 0
+        fi
     fi
     status=0
     result=$(aws s3api upload-part ${AR_AWS_OPTIONS[@]+"${AR_AWS_OPTIONS[@]}"} --bucket "${AR_BUCKET}" --key "${key}" \
@@ -1039,7 +1064,10 @@ ar_upload_part() {
         --query '[ETag, ChecksumSHA256]' --output text 2> "${dir}/${part}.err") || status=$?
     rm -f -- "${piece}"
     if [[ "${status}" -eq 0 ]]; then
-        printf '%s\n' "${result}" > "${dir}/${part}.result"
+        # The part's ETag, and the SHA-256 computed here, which completing
+        # the upload names: not the one the response echoes, which an
+        # S3-compatible service may leave out.
+        printf '%s\t%s\n' "${result%%$'\t'*}" "${checksum[1]:-}" > "${dir}/${part}.result"
         echo 0 > "${dir}/${part}.status"
     elif [[ "$(ar_aws_status "${dir}/${part}.err")" == "denied" ]]; then
         echo "${AR_DENIED}" > "${dir}/${part}.status"
