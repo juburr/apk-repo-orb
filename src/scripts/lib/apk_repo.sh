@@ -28,6 +28,13 @@ AR_ABSENT=3
 AR_DENIED=4
 AR_PRECONDITION=5
 AR_CONFLICT=6
+AR_TOO_LARGE=7
+
+# The most bytes a download may hold, when ar_get_object is given no other
+# limit: an index (as apk_repo.py's INDEX_LIMIT), and a sidecar's signature
+# (an RSA signature is the key's size: 1 KiB for a 8192-bit key).
+AR_INDEX_MAX=$((128 * 1024 * 1024))
+AR_SIG_MAX=8192
 
 # The oldest AWS CLI v2 whose s3api put-object takes --if-match; 2.17.34
 # added --if-none-match.
@@ -312,9 +319,11 @@ ar_read_index() {
     local arch=$1 key=$2 out=$3 work=$4 allow_missing=${5:-false} status expected
     local pinned_sha256=${AR_PIN_SHA256[$1]:-} pinned_version=${AR_PIN_VERSION_ID[$1]:-}
     status=0
-    ar_get_object "${key}" "${out}" "${pinned_version}" || status=$?
+    ar_get_object "${key}" "${out}" "${pinned_version}" "${AR_INDEX_MAX}" || status=$?
     case "${status}" in
         0) ;;
+        "${AR_TOO_LARGE}")
+            ar_die "$(ar_s3_url "${key}") is larger than an index can be (${AR_INDEX_MAX} bytes); refusing to read the rest of it." ;;
         "${AR_ABSENT}")
             if [[ -n "${pinned_version}" ]]; then
                 ar_die "$(ar_s3_url "${key}") has no version ${pinned_version} (index_version_id)." \
@@ -728,26 +737,46 @@ ar_denied_hint() {
         "Grant s3:GetObject on $(ar_s3_url "${1%/*}")/* and s3:ListBucket on the bucket (README: Bucket Setup)."
 }
 
-# ar_get_object KEY OUT [VERSION_ID]: downloads KEY to OUT, or that version
-# of it. Returns 0 (setting AR_ETAG and AR_VERSION_ID), AR_ABSENT (no such
-# key or version) or AR_DENIED; any other error is fatal.
+# ar_get_object KEY OUT [VERSION_ID] [MAX]: downloads KEY to OUT, or that
+# version of it. With MAX, it asks for no more than MAX + 1 bytes (a Range
+# request), and an object larger than MAX is refused without reading the
+# rest: nothing from the bucket, which isn't trusted, can fill the disk. An
+# empty object, which a Range request can't be satisfied for (416), is
+# read as an empty file. Returns 0 (setting AR_ETAG and AR_VERSION_ID),
+# AR_ABSENT (no such key or version), AR_DENIED or AR_TOO_LARGE (OUT
+# removed); any other error is fatal.
 ar_get_object() {
-    local key=$1 out=$2 status result err kind
-    local -a version=()
+    local key=$1 out=$2 max=${4:-} status result err kind
+    local -a version=() range=()
     # --version-id=VALUE, so a version ID starting with - isn't an option.
     if [[ -n "${3:-}" ]]; then
         version=("--version-id=$3")
+    fi
+    if [[ -n "${max}" ]]; then
+        range=(--range "bytes=0-${max}")
     fi
     # Its own error file, since ar_get_objects runs several at once.
     err=$(mktemp "${AR_WORK}/aws.XXXXXX")
     status=0
     result=$(aws s3api get-object ${AR_AWS_OPTIONS[@]+"${AR_AWS_OPTIONS[@]}"} --bucket "${AR_BUCKET}" --key "${key}" \
-        ${version[@]+"${version[@]}"} --query '[ETag, VersionId]' --output text "${out}" 2> "${err}") || status=$?
+        ${version[@]+"${version[@]}"} ${range[@]+"${range[@]}"} --query '[ETag, VersionId]' --output text "${out}" 2> "${err}") || status=$?
+    if [[ "${status}" -ne 0 && -n "${max}" ]] && grep -qE '\((InvalidRange|416)\)' "${err}"; then
+        # An empty object: there is no byte 0 to start the range at.
+        rm -f -- "${err}"
+        : > "${out}"
+        AR_ETAG=""
+        AR_VERSION_ID=""
+        return 0
+    fi
     if [[ "${status}" -eq 0 ]]; then
         rm -f -- "${err}"
         AR_ETAG=${result%%$'\t'*}
         AR_VERSION_ID=${result#*$'\t'}
         [[ "${AR_VERSION_ID}" == "None" || "${AR_VERSION_ID}" == "null" ]] && AR_VERSION_ID=""
+        if [[ -n "${max}" ]] && (( $(stat -c %s -- "${out}") > max )); then
+            rm -f -- "${out}"
+            return "${AR_TOO_LARGE}"
+        fi
         return 0
     fi
     rm -f -- "${out}"
@@ -760,19 +789,19 @@ ar_get_object() {
     ar_die "Couldn't read $(ar_s3_url "${key}")${3:+ version $3}: the AWS CLI's GetObject exited ${status}, with the message above."
 }
 
-# ar_get_objects LIST: downloads every "KEY<TAB>OUT<TAB>STATUS" line of LIST,
-# AR_PARALLEL at a time, and writes each ar_get_object status (0, AR_ABSENT
-# or AR_DENIED) to its STATUS file. A STATUS file left empty means another
-# failure, whose error is printed already. Check them with
-# ar_require_fetched and ar_optional_fetched. Batches rather than wait -n,
-# which bash before 4.3 lacks.
+# ar_get_objects LIST: downloads every "KEY<TAB>OUT<TAB>STATUS[<TAB>MAX]"
+# line of LIST, AR_PARALLEL at a time, and writes each ar_get_object status
+# (0, AR_ABSENT, AR_DENIED or AR_TOO_LARGE) to its STATUS file. A STATUS
+# file left empty means another failure, whose error is printed already.
+# Check them with ar_require_fetched and ar_optional_fetched. Batches rather
+# than wait -n, which bash before 4.3 lacks.
 ar_get_objects() {
-    local key out status_file count=0
-    while IFS=$'\t' read -r key out status_file; do
+    local key out status_file max count=0
+    while IFS=$'\t' read -r key out status_file max; do
         : > "${status_file}"
         (
             status=0
-            ar_get_object "${key}" "${out}" || status=$?
+            ar_get_object "${key}" "${out}" "" "${max}" || status=$?
             printf '%s\n' "${status}" > "${status_file}"
         ) &
         count=$((count + 1))
@@ -783,26 +812,43 @@ ar_get_objects() {
     wait
 }
 
-# ar_require_fetched STATUS KEY WHAT: KEY, which the index requires for WHAT,
-# was downloaded; anything else is fatal.
+# ar_require_fetched STATUS KEY WHAT [MAX]: KEY, which the index requires
+# for WHAT, was downloaded; anything else is fatal. MAX is the size it was
+# held to.
 ar_require_fetched() {
     case "$(cat -- "$1")" in
         0) ;;
         "${AR_ABSENT}") ar_die "$(ar_s3_url "$2") is missing, though the index lists $3." \
             "The repository is incomplete; publish the package again." ;;
         "${AR_DENIED}") ar_die "Access to $(ar_s3_url "$2") was denied." "$(ar_denied_hint "$2")" ;;
+        "${AR_TOO_LARGE}") ar_die "$(ar_s3_url "$2") is larger than the ${4:-} bytes it can be for $3; refusing to read the rest of it." ;;
         *) ar_die "Couldn't read $(ar_s3_url "$2"); the error is above." ;;
     esac
 }
 
 # ar_optional_fetched STATUS KEY: KEY, a signature that may not exist, was
-# downloaded or is absent; denied or another failure is fatal.
+# downloaded, is absent, or is too large to be a signature, which is only a
+# warning: signatures are immutable, so a stray one must not make a package
+# unreadable for good. Denied or another failure is fatal.
 ar_optional_fetched() {
     case "$(cat -- "$1")" in
         0 | "${AR_ABSENT}") ;;
+        "${AR_TOO_LARGE}") ar_warn "$(ar_s3_url "$2") is larger than a signature can be (${AR_SIG_MAX} bytes); ignoring it." ;;
         "${AR_DENIED}") ar_die "Access to $(ar_s3_url "$2") was denied." "$(ar_denied_hint "$2")" ;;
         *) ar_die "Couldn't read $(ar_s3_url "$2"); the error is above." ;;
     esac
+}
+
+# ar_prune_signatures DIR FILE: after ar_verify_sidecar DIR FILE, removes
+# FILE's sidecar signatures in DIR that didn't verify (those of keys not in
+# AR_SIDECAR_KEYS), so only verified bytes are passed on.
+ar_prune_signatures() {
+    local key
+    for key in ${AR_KEY_NAMES[@]+"${AR_KEY_NAMES[@]}"}; do
+        if [[ " ${AR_SIDECAR_KEYS[*]} " != *" ${key} "* ]]; then
+            rm -f -- "$1/$2.sha256.${key}.sig"
+        fi
+    done
 }
 
 # ar_put_object KEY FILE CONTENT_TYPE CACHE_CONTROL CONDITION: uploads FILE

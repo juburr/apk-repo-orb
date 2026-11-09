@@ -10,7 +10,8 @@
 #   - every run step has a name, as orb-tools review's RC008 asks;
 #   - the README documents every command and names its GitHub Action;
 #   - the name, version and key name patterns are the same in the shell
-#     library and the Python helper, which both check them;
+#     library and the Python helper, which both check them, and so is the
+#     largest index (AR_INDEX_MAX and INDEX_LIMIT);
 #   - the Python helper parses as Python 3.8, the oldest it supports;
 #   - T-8: no script, workflow or action outside the test fixtures runs a
 #     high-level `aws s3` command, deletes anything, or writes with
@@ -141,6 +142,13 @@ for pattern in NAME VERSION KEY; do
         fail "AR_${pattern}_RE in lib/apk_repo.sh is '${shell}', but ${pattern}_RE in apk_repo.py is '${python}'"
     fi
 done
+
+# The largest index pull and inspect download, and the largest the helper reads.
+shell_max=$(sed -nE 's/^AR_INDEX_MAX=\$\(\((.*)\)\)$/\1/p' src/scripts/lib/apk_repo.sh)
+python_max=$(sed -nE 's/^INDEX_LIMIT = (.*)$/\1/p' src/scripts/apk_repo.py)
+if [[ -z "${shell_max}" || "$((shell_max))" != "$((python_max))" ]]; then
+    fail "AR_INDEX_MAX in lib/apk_repo.sh is '${shell_max}', but INDEX_LIMIT in apk_repo.py is '${python_max}'"
+fi
 
 # The oldest Python the helper supports.
 if ! python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), feature_version=(3, 8))' src/scripts/apk_repo.py 2> /dev/null; then

@@ -85,6 +85,17 @@ ar_check_receipt_path "${RECEIPT_PATH}"
 if [[ -z "${OUT_DIR}" ]]; then
     ar_usage "out_dir is required."
 fi
+# A path that starts with - is a path, not an option, to every tool below.
+[[ "${OUT_DIR}" == -* ]] && OUT_DIR="./${OUT_DIR}"
+[[ "${CACHE_DIR}" == -* ]] && CACHE_DIR="./${CACHE_DIR}"
+# out_dir and cache_dir are checked now, before anything is downloaded, so a
+# pull that has done its work can't fail on them after out_dir is filled.
+if [[ -e "${OUT_DIR}" && ! -d "${OUT_DIR}" ]]; then
+    ar_usage "out_dir ${OUT_DIR} exists and isn't a directory."
+fi
+if [[ -n "${CACHE_DIR}" && -e "${CACHE_DIR}" && ! -d "${CACHE_DIR}" ]]; then
+    ar_usage "cache_dir ${CACHE_DIR} exists and isn't a directory."
+fi
 # A pinned read: the index's bytes (a SHA-256 from an earlier receipt) and,
 # in a versioned bucket, which version of it to read, so a pull can fetch
 # that snapshot again. Packages are immutable, so the index fixes them too.
@@ -106,6 +117,10 @@ for arch in "${AR_ARCHES[@]}"; do
                 "Pull into a fresh out_dir, or remove ${OUT_DIR}/${arch} first."
         fi
     fi
+    # A symbolic link there, even a dangling one, is left alone (below).
+    if [[ -n "${CACHE_DIR}" && ! -L "${CACHE_DIR}/${arch}" && -e "${CACHE_DIR}/${arch}" && ! -d "${CACHE_DIR}/${arch}" ]]; then
+        ar_usage "cache_dir ${CACHE_DIR}/${arch} exists and isn't a directory."
+    fi
 done
 rm -f -- "${RECEIPT_PATH}"
 
@@ -114,66 +129,108 @@ mkdir -p "${AR_WORK}/receipt"
 ar_receipt_meta tool_version "${AR_TOOL_VERSION}" operation pull dry_run false backend "${BACKEND}" \
     endpoint_url "${ENDPOINT_URL}" bucket "${BUCKET}" prefix "${PREFIX}" started "$(ar_now)"
 
+# Every architecture's index is read, verified and checked against the pins
+# and packages before any package is downloaded, so a mismatch in one
+# architecture costs no other architecture's downloads.
+declare -A INDEX_ETAG=() INDEX_VERSION_ID=() INDEX_KEY=()
 for arch in "${AR_ARCHES[@]}"; do
     stage="${AR_WORK}/stage/${arch}"
-    mkdir -p "${stage}"
+    mkdir -p "${stage}" "${AR_WORK}/receipt/arch/${arch}"
     key="${PREFIX}/${arch}/APKINDEX.tar.gz"
     ar_read_index "${arch}" "${key}" "${stage}/APKINDEX.tar.gz" "${AR_WORK}/${arch}"
     # A selective pull: the signed index as it is, and only these packages.
     ar_select_entries "${AR_WORK}/${arch}" "$(ar_s3_url "${key}")"
-    mkdir -p "${AR_WORK}/receipt/arch/${arch}"
     if [[ ${#AR_SELECTION[@]} -gt 0 ]]; then
         printf '%s\n' "${AR_SELECTION[@]}" > "${AR_WORK}/receipt/arch/${arch}/selection"
     fi
-    etag=${AR_INDEX_ETAG}
-    version_id=${AR_INDEX_VERSION_ID}
+    INDEX_ETAG[${arch}]=${AR_INDEX_ETAG}
+    INDEX_VERSION_ID[${arch}]=${AR_INDEX_VERSION_ID}
+    INDEX_KEY[${arch}]=${AR_INDEX_KEY}
+done
 
+for arch in "${AR_ARCHES[@]}"; do
+    stage="${AR_WORK}/stage/${arch}"
+    key="${PREFIX}/${arch}/APKINDEX.tar.gz"
     # Only what the verified index lists: each package's sidecar and its
     # signatures by keyring keys, then the package itself, from the cache
     # when a cached copy matches the signed sidecar. Downloads run in
-    # parallel; everything is verified here, one by one.
+    # parallel, each held to the size it can be: a sidecar's exact line, a
+    # signature's AR_SIG_MAX, and the package's size in the index.
+    # Everything is verified here, one by one.
     fetched="${AR_WORK}/fetched/${arch}"
     mkdir -p "${fetched}"
     : > "${fetched}/sidecars"
     : > "${fetched}/packages"
     while IFS=$'\t' read -r name version _; do
         file="${name}-${version}.apk"
-        printf '%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}.sha256" "${stage}/${file}.sha256" "${fetched}/${file}.sha256" >> "${fetched}/sidecars"
+        printf '%s\t%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}.sha256" "${stage}/${file}.sha256" "${fetched}/${file}.sha256" \
+            "$((64 + 2 + ${#file} + 1))" >> "${fetched}/sidecars"
         for signer in "${AR_KEY_NAMES[@]}"; do
-            printf '%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}.sha256.${signer}.sig" "${stage}/${file}.sha256.${signer}.sig" \
-                "${fetched}/${file}.sha256.${signer}.sig" >> "${fetched}/sidecars"
+            printf '%s\t%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}.sha256.${signer}.sig" "${stage}/${file}.sha256.${signer}.sig" \
+                "${fetched}/${file}.sha256.${signer}.sig" "${AR_SIG_MAX}" >> "${fetched}/sidecars"
         done
     done < "${AR_WORK}/${arch}/entries.tsv"
     ar_get_objects "${fetched}/sidecars"
     downloaded=0
     reused=0
-    while IFS=$'\t' read -r name version _; do
+    while IFS=$'\t' read -r name version _ size _; do
         file="${name}-${version}.apk"
-        ar_require_fetched "${fetched}/${file}.sha256" "${PREFIX}/${arch}/${file}.sha256" "${name} ${version}"
+        ar_require_fetched "${fetched}/${file}.sha256" "${PREFIX}/${arch}/${file}.sha256" "${name} ${version}" \
+            "$((64 + 2 + ${#file} + 1))"
         for signer in "${AR_KEY_NAMES[@]}"; do
             ar_optional_fetched "${fetched}/${file}.sha256.${signer}.sig" "${PREFIX}/${arch}/${file}.sha256.${signer}.sig"
         done
         ar_verify_sidecar "${stage}" "${file}"
+        # A signature that didn't verify goes no further than here.
+        ar_prune_signatures "${stage}" "${file}"
         cached="${CACHE_DIR:+${CACHE_DIR}/${arch}/${file}}"
         if [[ -n "${cached}" && -f "${cached}" && "$(ar_sha256 "${cached}")" == "${AR_SIDECAR_SHA256}" ]]; then
             cp -- "${cached}" "${stage}/${file}"
             reused=$((reused + 1))
         else
-            printf '%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}" "${stage}/${file}" "${fetched}/${file}" >> "${fetched}/packages"
+            printf '%s\t%s\t%s\t%s\n' "${PREFIX}/${arch}/${file}" "${stage}/${file}" "${fetched}/${file}" "${size}" >> "${fetched}/packages"
             downloaded=$((downloaded + 1))
         fi
     done < "${AR_WORK}/${arch}/entries.tsv"
     ar_get_objects "${fetched}/packages"
-    while IFS=$'\t' read -r object package status_file; do
-        ar_require_fetched "${status_file}" "${object}" "$(basename -- "${package}")"
+    while IFS=$'\t' read -r object package status_file size; do
+        ar_require_fetched "${status_file}" "${object}" "$(basename -- "${package}")" "${size}"
     done < "${fetched}/packages"
 
     ar_verify_packages "${stage}" "${arch}" "${AR_WORK}/${arch}" "${AR_WORK}/receipt/arch/${arch}"
-    printf '%s\t%s\n' key "${key}" sha256 "$(ar_sha256 "${stage}/APKINDEX.tar.gz")" etag "${etag}" \
-        version_id "${version_id}" signature ".SIGN.RSA256.${AR_INDEX_KEY}.pub" \
+    printf '%s\t%s\n' key "${key}" sha256 "$(ar_sha256 "${stage}/APKINDEX.tar.gz")" etag "${INDEX_ETAG[${arch}]}" \
+        version_id "${INDEX_VERSION_ID[${arch}]}" signature ".SIGN.RSA256.${INDEX_KEY[${arch}]}.pub" \
         pinned "$([[ -n "${AR_PIN_SHA256[${arch}]}" ]] && echo true || echo false)" > "${AR_WORK}/receipt/arch/${arch}/index.tsv"
-    echo "Verified ${arch}: an index signed with ${AR_INDEX_KEY}, ${downloaded} package(s) downloaded, ${reused} from the cache."
+    echo "Verified ${arch}: an index signed with ${INDEX_KEY[${arch}]}, ${downloaded} package(s) downloaded, ${reused} from the cache."
 done
+
+# fill_cache ARCH: copies out_dir/ARCH's packages into cache_dir/ARCH. A
+# convenience only: any failure is a warning, never a failed pull, since
+# out_dir is filled already. Each file is new, renamed into place, so a
+# symbolic link left in a restored cache is replaced, never written through,
+# and a symbolic link at cache_dir/ARCH itself is left alone.
+fill_cache() {
+    local arch=$1 dir="${CACHE_DIR}/$1" package target partial
+    if [[ -L "${dir}" ]]; then
+        ar_warn "cache_dir ${dir} is a symbolic link; leaving it as it is."
+        return 0
+    fi
+    if ! mkdir -p -- "${dir}"; then
+        ar_warn "Couldn't create cache_dir ${dir}; the cache isn't updated."
+        return 0
+    fi
+    for package in "${OUT_DIR}/${arch}"/*.apk; do
+        [[ -f "${package}" ]] || continue
+        target="${dir}/$(basename -- "${package}")"
+        [[ -d "${target}" ]] && continue
+        partial=""
+        if ! partial=$(mktemp "${dir}/.partial.XXXXXX") || ! cp -- "${package}" "${partial}" \
+            || ! mv -f -- "${partial}" "${target}"; then
+            [[ -n "${partial}" ]] && rm -f -- "${partial}"
+            ar_warn "Couldn't add $(basename -- "${package}") to cache_dir ${dir}."
+        fi
+    done
+}
 
 # P-2: only verified repositories reach out_dir, all architectures at once.
 mkdir -p -- "${OUT_DIR}"
@@ -182,23 +239,11 @@ for arch in "${AR_ARCHES[@]}"; do
         rmdir -- "${OUT_DIR}/${arch}"
     fi
     mv -- "${AR_WORK}/stage/${arch}" "${OUT_DIR}/${arch}"
-    if [[ -n "${CACHE_DIR}" ]]; then
-        mkdir -p -- "${CACHE_DIR}/${arch}"
-        if [[ -L "${CACHE_DIR}/${arch}" ]]; then
-            ar_warn "cache_dir ${CACHE_DIR}/${arch} is a symbolic link; leaving it as it is."
-        else
-            for package in "${OUT_DIR}/${arch}"/*.apk; do
-                [[ -f "${package}" ]] || continue
-                target="${CACHE_DIR}/${arch}/$(basename -- "${package}")"
-                [[ -d "${target}" ]] && continue
-                # A new file of our own, renamed into place: a symbolic link
-                # in a restored cache is replaced, never written through.
-                partial=$(mktemp "${CACHE_DIR}/${arch}/.partial.XXXXXX")
-                cp -- "${package}" "${partial}"
-                mv -f -- "${partial}" "${target}"
-            done
-        fi
-    fi
     echo "Pulled $(ar_s3_url "${PREFIX}/${arch}") into ${OUT_DIR}/${arch}."
 done
+if [[ -n "${CACHE_DIR}" ]]; then
+    for arch in "${AR_ARCHES[@]}"; do
+        fill_cache "${arch}"
+    done
+fi
 ar_write_receipt "${RECEIPT_PATH}"

@@ -1030,6 +1030,99 @@ s3_put() {
         aws s3api put-object --bucket bucket --key "$1" --body "$2" --if-none-match "*" > /dev/null)
 }
 
+begin "P-11: pull reads only what it needs, and passes on only what verified"
+new_case
+package x86_64 hello 1.0.0-r0
+package x86_64 world 2.1-r3
+package aarch64 hello 1.0.0-r0
+publish_new PARAM_ARCH="x86_64 aarch64"
+# A keyring with a second key, as during a key rotation: pull then fetches
+# each sidecar's signature by that key too, which anyone who can create
+# objects in the bucket can plant.
+mkdir -p "${CASE}/two-keys"
+cp "${WORK}/keys/test-apk.rsa.pub" "${WORK}/keys/other-apk.rsa.pub" "${CASE}/two-keys/"
+head -c 512 /dev/urandom > "${CASE}/bad.sig"
+s3_put test/os/x86_64/hello-1.0.0-r0.apk.sha256.other-apk.rsa.sig "${CASE}/bad.sig"
+: > "${CASE}/empty.sig"
+s3_put test/os/x86_64/world-2.1-r3.apk.sha256.other-apk.rsa.sig "${CASE}/empty.sig"
+head -c $((1024 * 1024)) /dev/urandom > "${CASE}/huge.sig"
+s3_put test/os/aarch64/hello-1.0.0-r0.apk.sha256.other-apk.rsa.sig "${CASE}/huge.sig"
+: > "${CASE}/aws.log"
+run pull PARAM_ARCH="x86_64 aarch64" PARAM_KEYRING="${CASE}/two-keys" PARAM_OUT_DIR=pulled
+check "stray signatures by another keyring key don't fail the pull" succeeded
+check "one that doesn't verify is warned about" said "WARN: hello-1.0.0-r0.apk.sha256.other-apk.rsa.sig doesn't verify with other-apk.rsa.pub"
+check "and doesn't reach out_dir" absent "${CASE}/pulled/x86_64/hello-1.0.0-r0.apk.sha256.other-apk.rsa.sig"
+check "while the signature that verified does" exists "${CASE}/pulled/x86_64/hello-1.0.0-r0.apk.sha256.test-apk.rsa.sig"
+check "an empty one (which a Range request can't be satisfied for) doesn't either" absent "${CASE}/pulled/x86_64/world-2.1-r3.apk.sha256.other-apk.rsa.sig"
+check "one larger than a signature can be is ignored with a warning" said "is larger than a signature can be (8192 bytes); ignoring it."
+check "without reading more than 8193 bytes of it" logged '^GetObject test/os/aarch64/hello-1\.0\.0-r0\.apk\.sha256\.other-apk\.rsa\.sig range=bytes=0-8192 '
+check "and doesn't reach out_dir" absent "${CASE}/pulled/aarch64/hello-1.0.0-r0.apk.sha256.other-apk.rsa.sig"
+check "every download asks for no more than it can use" not_logged '^GetObject [^ ]+ none '
+check "an index, at most 128 MiB" logged '^GetObject test/os/x86_64/APKINDEX\.tar\.gz range=bytes=0-134217728 '
+check "a sidecar, its exact line" logged '^GetObject test/os/x86_64/hello-1\.0\.0-r0\.apk\.sha256 range=bytes=0-85 '
+check "a package, the size the index gives" logged "^GetObject test/os/x86_64/hello-1\\.0\\.0-r0\\.apk range=bytes=0-$(stat -c %s "$(s3 test/os/x86_64/hello-1.0.0-r0.apk)") "
+run verify PARAM_ARCH="x86_64 aarch64" PARAM_KEYRING="${CASE}/two-keys" PARAM_DIR=pulled
+check "and verify accepts what pull wrote" succeeded
+
+printf 'more\n' >> "$(s3 test/os/x86_64/world-2.1-r3.apk.sha256)"
+run pull PARAM_OUT_DIR=long-sidecar
+check "a sidecar longer than its one line fails the pull" exited 1
+check "saying so, without reading the rest" said "world-2.1-r3.apk.sha256 is larger than the 83 bytes it can be for world 2.1-r3"
+printf 'x' >> "$(s3 test/os/aarch64/hello-1.0.0-r0.apk)"
+run pull PARAM_ARCH=aarch64 PARAM_OUT_DIR=long-package
+check "a package larger than the index says fails the pull" exited 1
+check "saying so, without reading the rest" said "hello-1.0.0-r0.apk is larger than the"
+check "and nothing reaches out_dir" absent "${CASE}/long-package/aarch64"
+
+new_case
+printf 'index\n' > "${CASE}/index"
+s3_put test/os/x86_64/APKINDEX.tar.gz "${CASE}/index"
+# Sparse: 200 MiB in the bucket, of which the pull may read 128 MiB and a byte.
+truncate -s $((200 * 1024 * 1024)) "$(s3 test/os/x86_64/APKINDEX.tar.gz)"
+run pull PARAM_OUT_DIR=pulled
+check "an index larger than 128 MiB fails the pull" exited 1
+check "saying so" said "is larger than an index can be (134217728 bytes)"
+run inspect
+check "and inspect" said "is larger than an index can be"
+
+new_case
+package x86_64 hello 1.0.0-r0
+package aarch64 hello 1.0.0-r0
+package x86_64 world 2.1-r3
+publish_new PARAM_ARCH="x86_64 aarch64"
+: > "${CASE}/aws.log"
+run pull PARAM_ARCH="x86_64 aarch64" PARAM_OUT_DIR=pulled PARAM_PACKAGES="world=2.1-r3"
+check "P-10: packages one architecture's index doesn't list fails" exited 1
+check "before any package or sidecar of any architecture is read" [ "$(grep -c '^GetObject' "${CASE}/aws.log")" -eq "$(grep -c '^GetObject [^ ]*/APKINDEX\.tar\.gz ' "${CASE}/aws.log")" ]
+: > "${CASE}/aws.log"
+run pull PARAM_ARCH="x86_64 aarch64" PARAM_OUT_DIR=pulled \
+    PARAM_INDEX_SHA256="x86_64=$(sha256sum < "$(s3 test/os/x86_64/APKINDEX.tar.gz)" | cut -c1-64) aarch64=$(printf '0%.0s' $(seq 64))"
+check "P-9: a pin one architecture's index doesn't match fails" exited 1
+check "before any package or sidecar of any architecture is read" [ "$(grep -c '^GetObject' "${CASE}/aws.log")" -eq "$(grep -c '^GetObject [^ ]*/APKINDEX\.tar\.gz ' "${CASE}/aws.log")" ]
+
+: > "${CASE}/aws.log"
+printf 'a file\n' > "${CASE}/file"
+run pull PARAM_OUT_DIR=file
+check "P-1: an out_dir that is a file is a usage error (2)" exited 2
+run pull PARAM_CACHE_DIR=file
+check "and so is a cache_dir that is a file" exited 2
+mkdir -p "${CASE}/cache"
+printf 'a file\n' > "${CASE}/cache/x86_64"
+run pull PARAM_CACHE_DIR=cache
+check "and a cache_dir/<arch> that is a file" exited 2
+check "all before any AWS call" not_logged '.'
+rm -f "${CASE}/cache/x86_64"
+ln -s "${CASE}/nowhere" "${CASE}/cache/x86_64"
+run pull PARAM_OUT_DIR=dangling PARAM_CACHE_DIR=cache
+check "P-6: a dangling symbolic link at cache_dir/<arch> doesn't fail the pull" succeeded
+check "which leaves it alone, with a warning" said "WARN: cache_dir cache/x86_64 is a symbolic link; leaving it as it is."
+check "and fills out_dir" exists "${CASE}/dangling/x86_64/hello-1.0.0-r0.apk"
+check "and writes the receipt" exists "${CASE}/apk-repo-receipt.json"
+run pull PARAM_OUT_DIR=-out PARAM_CACHE_DIR=-cache
+check "an out_dir and a cache_dir that start with - are paths, not options" succeeded
+check "filling out_dir" exists "${CASE}/-out/x86_64/hello-1.0.0-r0.apk"
+check "and the cache" exists "${CASE}/-cache/x86_64/hello-1.0.0-r0.apk"
+
 begin "E-1: an architecture list that comes out empty"
 new_case
 repo "${CASE}/repo" x86_64 hello 1.0.0-r0

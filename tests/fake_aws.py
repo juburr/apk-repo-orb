@@ -39,8 +39,10 @@ created with --checksum-algorithm SHA256 needs each part's ChecksumSHA256
 when it completes. Rules apply to the operations CreateMultipartUpload,
 UploadPart, CompleteMultipartUpload and AbortMultipartUpload too.
 
-The log line of a GetObject with --version-id has version=<id>, and an
-UploadPart's part=<number>, where other calls have their condition.
+The log line of a GetObject with --version-id has version=<id> (or else,
+with --range, range=<range>), and an UploadPart's part=<number>, where
+other calls have their condition. get-object --range bytes=A-B writes only
+those bytes, as S3 does, and an empty object answers 416 InvalidRange.
 """
 
 import base64
@@ -57,6 +59,7 @@ ERRORS = {
     "404": ("NoSuchKey", "The specified key does not exist."),
     "NoSuchVersion": ("NoSuchVersion", "The specified version does not exist."),
     "InvalidVersion": ("InvalidArgument", "Invalid version id specified"),
+    "InvalidRange": ("InvalidRange", "The requested range is not satisfiable"),
     "409": ("ConditionalRequestConflict",
             "The conditional request cannot succeed due to a conflicting operation against this resource."),
     "412": ("PreconditionFailed", "At least one of the pre-conditions you specified did not hold"),
@@ -174,6 +177,8 @@ def main(argv):
     version_id = options.get("--version-id")
     if version_id is not None and operation == "GetObject":
         condition = "version=%s" % version_id
+    elif "--range" in options and operation == "GetObject":
+        condition = "range=%s" % options["--range"]
     if operation == "UploadPart":
         condition = "part=%s" % options.get("--part-number")
     log = os.environ.get("FAKE_AWS_LOG")
@@ -207,8 +212,29 @@ def main(argv):
                     error(operation, "InvalidVersion")
             if not exists:
                 error(operation, "404")
+            size = os.path.getsize(path)
+            start, end = 0, size - 1
+            if "--range" in options:
+                match = re.fullmatch(r"bytes=(\d+)-(\d*)", options["--range"])
+                if not match:
+                    sys.stderr.write("fake aws: unsupported --range %s\n" % options["--range"])
+                    return 252
+                start = int(match.group(1))
+                if match.group(2):
+                    end = min(end, int(match.group(2)))
+                if start >= size:
+                    error(operation, "InvalidRange")
+            # Only the bytes asked for are read, so a test can stand a huge
+            # sparse object in the bucket.
             with open(path, "rb") as source, open(positional[2], "wb") as target:
-                target.write(source.read())
+                source.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk = source.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                    remaining -= len(chunk)
             output(options, {"ETag": current["ETag"], "VersionId": current.get("VersionId"),
                              "ContentType": current.get("ContentType")})
             return 0
