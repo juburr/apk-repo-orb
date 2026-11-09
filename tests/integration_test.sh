@@ -246,6 +246,31 @@ else
     echo "  skipped: pulling a replaced index by its version, since ${VERSIONED_BUCKET} isn't versioned."
 fi
 
+begin "P-11: stray signatures and Range requests"
+new_case stray
+package x86_64 hello 1.0-r0
+package x86_64 world 2.0-r0
+run publish allow_create=true
+check "the repository is created" succeeded
+# Signatures by a second keyring key, as anyone who can create objects in
+# the bucket could plant them: empty (a Range request on it is a 416), and
+# too large to be a signature. (The offline tests cover one that doesn't
+# verify.)
+mkdir -p "${CASE}/two-keys"
+cp "${WORK}/keys/test-apk.rsa.pub" "${WORK}/keys/other-apk.rsa.pub" "${CASE}/two-keys/"
+: > "${CASE}/empty.sig"
+head -c $((1024 * 1024)) /dev/urandom > "${CASE}/huge.sig"
+for planted in "hello-1.0-r0.apk.sha256.other-apk.rsa.sig empty" "world-2.0-r0.apk.sha256.other-apk.rsa.sig huge"; do
+    aws s3api put-object ${ENDPOINT_ARGS[@]+"${ENDPOINT_ARGS[@]}"} --bucket "${BUCKET}" --key "${PREFIX}/x86_64/${planted%% *}" \
+        --body "${CASE}/${planted##* }.sig" --if-none-match "*" > /dev/null
+done
+run pull arch=x86_64 out_dir=pulled keyring="${CASE}/two-keys"
+check "pull succeeds past an empty and an oversized stray signature" succeeded
+check "ignoring the oversized one" said "is larger than a signature can be"
+check "passing neither on to out_dir" [ -z "$(find "${CASE}/pulled/x86_64" -name '*.other-apk.rsa.sig')" ]
+run verify arch=x86_64 dir=pulled keyring="${CASE}/two-keys"
+check "and verify accepts what pull wrote" succeeded
+
 begin "U-8, P-4: a prefix with no repository"
 new_case missing
 package x86_64 hello 1.0-r0
