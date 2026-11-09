@@ -57,6 +57,19 @@ if ((BASH_VERSINFO[0] < 4)); then
     echo "ERROR: apk-repo-orb needs bash 4 or newer; this is bash ${BASH_VERSION}." >&2
     exit 1
 fi
+# U-1: the private key is read first, before this script sets a variable
+# of its own (so signing_key can name any variable, even one it uses) or
+# runs any tool, and taken out of the environment at once, so nothing this
+# script runs (circleci, aws, python3, openssl, melange) inherits it.
+# xtrace stays off, and it is only ever written to KEY_FILE (below).
+set +o xtrace
+: "${PARAM_SIGNING_KEY:=APK_SIGNING_KEY}"
+AR_SIGNING_KEY_PEM=""
+if [[ "${PARAM_SIGNING_KEY}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "${PARAM_SIGNING_KEY}" != AR_* \
+    && "${PARAM_SIGNING_KEY}" != PARAM_* && "${PARAM_SIGNING_KEY}" != SCRIPT_APK_REPO_* ]]; then
+    AR_SIGNING_KEY_PEM=${!PARAM_SIGNING_KEY:-}
+    unset -v "${PARAM_SIGNING_KEY}"
+fi
 if [[ -z "${SCRIPT_APK_REPO_LIB:-}" ]]; then
     SCRIPT_APK_REPO_LIB=$(cat "$(dirname "${BASH_SOURCE[0]}")/lib/apk_repo.sh")
 fi
@@ -81,7 +94,7 @@ REGION=$(ar_subst "${PARAM_REGION:-}")
 ARCH=$(ar_subst "${PARAM_ARCH:-}")
 KEYRING=$(ar_subst "${PARAM_KEYRING:-}")
 PACKAGES_DIR=$(ar_subst "${PARAM_PACKAGES_DIR:-packages}")
-SIGNING_KEY=${PARAM_SIGNING_KEY:-APK_SIGNING_KEY}
+SIGNING_KEY=${PARAM_SIGNING_KEY}
 KEY_NAME=$(ar_subst "${PARAM_KEY_NAME:-}")
 RESIGN=$(ar_bool resign "${PARAM_RESIGN:-true}")
 ALLOW_CREATE=$(ar_bool allow_create "${PARAM_ALLOW_CREATE:-false}")
@@ -113,9 +126,22 @@ fi
 if ! ar_match "${SIGNING_KEY}" '^[A-Za-z_][A-Za-z0-9_]*$'; then
     ar_usage "signing_key must be the name of the environment variable that holds the private key, not '${SIGNING_KEY}'."
 fi
+if [[ "${SIGNING_KEY}" == AR_* || "${SIGNING_KEY}" == PARAM_* || "${SIGNING_KEY}" == SCRIPT_APK_REPO_* ]]; then
+    ar_usage "signing_key ${SIGNING_KEY} is a name the orb uses itself (AR_*, PARAM_*, SCRIPT_APK_REPO_*); hold the key in another variable."
+fi
 if [[ ! -d "${PACKAGES_DIR}" ]]; then
     ar_usage "packages_dir ${PACKAGES_DIR} is not a directory."
 fi
+
+# has_packages DIR: whether DIR holds a *.apk, with DIR taken literally (a
+# packages_dir with [, * or ? in it is a path, not a pattern).
+has_packages() {
+    local package
+    for package in "$1"/*.apk; do
+        [[ -e "${package}" ]] && return 0
+    done
+    return 1
+}
 
 # U-3: the architectures, and their packages.
 if [[ -n "${ARCH//[[:space:]]/}" ]]; then
@@ -125,7 +151,7 @@ else
     for directory in "${PACKAGES_DIR}"/*/; do
         [[ -d "${directory}" ]] || continue
         name=$(basename -- "${directory}")
-        if compgen -G "${PACKAGES_DIR}/${name}/*.apk" > /dev/null; then
+        if has_packages "${PACKAGES_DIR}/${name}"; then
             case "${name}" in
                 x86_64 | aarch64) found+=" ${name}" ;;
                 *) ar_usage "${PACKAGES_DIR}/${name} holds packages, but ${name} is not x86_64 or aarch64." ;;
@@ -150,13 +176,13 @@ fi
 KEY_DIR="${AR_WORK}/key"
 KEY_FILE="${KEY_DIR}/${KEY_NAME}"
 (umask 077 && mkdir -m 700 -- "${KEY_DIR}")
-# The private key: xtrace stays off, and it is only ever written to KEY_FILE.
-set +o xtrace
-if [[ -z "${!SIGNING_KEY:-}" ]]; then
+# The private key, read at the top: it is only ever written to KEY_FILE.
+if [[ -z "${AR_SIGNING_KEY_PEM}" ]]; then
     ar_usage "${SIGNING_KEY}, the environment variable signing_key names, is empty." \
         "Set it to the PEM private key (or the PEM base64-encoded) from a CircleCI context or a GitHub secret."
 fi
-(umask 077 && printf '%s\n' "${!SIGNING_KEY}" > "${KEY_FILE}")
+(umask 077 && printf '%s\n' "${AR_SIGNING_KEY_PEM}" > "${KEY_FILE}")
+AR_SIGNING_KEY_PEM=""
 if ! grep -q -- '-----BEGIN' "${KEY_FILE}"; then
     if ! (umask 077 && base64 -d < "${KEY_FILE}" > "${KEY_FILE}.pem" 2> /dev/null); then
         ar_usage "${SIGNING_KEY} holds neither a PEM private key nor a base64-encoded one."
@@ -175,9 +201,6 @@ if ! (umask 077 && { openssl rsa -in "${KEY_FILE}" -passin pass: -traditional -o
     ar_die "openssl couldn't rewrite the private key in ${SIGNING_KEY} in PKCS#1 form, which melange needs."
 fi
 mv -- "${KEY_FILE}.pkcs1" "${KEY_FILE}"
-# The key is in KEY_FILE now; the tools this script runs (aws, melange,
-# python3, and whatever runs them) don't inherit it.
-unset -v "${SIGNING_KEY}"
 # U-2: it must be the key the keyring names, so no job signs with another.
 openssl rsa -in "${KEY_FILE}" -pubout -outform DER -out "${AR_WORK}/derived.der" 2> /dev/null
 if ! openssl rsa -pubin -in "${AR_KEYS[${KEY_NAME}]}" -outform DER -out "${AR_WORK}/keyring.der" 2> /dev/null \
@@ -247,7 +270,7 @@ write_sidecars() {
 for arch in "${AR_ARCHES[@]}"; do
     stage="${AR_WORK}/stage/${arch}"
     mkdir -p "${stage}"
-    if ! compgen -G "${PACKAGES_DIR}/${arch}/*.apk" > /dev/null; then
+    if ! has_packages "${PACKAGES_DIR}/${arch}"; then
         ar_usage "${PACKAGES_DIR}/${arch} has no packages (*.apk)."
     fi
     for package in "${PACKAGES_DIR}/${arch}"/*.apk; do
@@ -290,12 +313,18 @@ for arch in "${AR_ARCHES[@]}"; do
     echo "Prepared $(find "${stage}" -maxdepth 1 -name '*.apk' | wc -l | tr -d ' ') ${arch} package(s) from ${PACKAGES_DIR}/${arch}."
 done
 
+# multipart FILE: whether FILE goes up in parts: the one test both the
+# check below (the AWS CLI, the F-17 probe) and put_immutable make.
+multipart() {
+    [[ "$(stat -L -c %s -- "$1")" -ge "${MULTIPART_THRESHOLD}" ]]
+}
+
 # Packages of multipart_threshold or more (as re-signed) go up in parts, and
 # need an AWS CLI that completes a multipart upload conditionally.
 MULTIPART=false
 for arch in "${AR_ARCHES[@]}"; do
     for package in "${AR_WORK}/stage/${arch}"/*.apk; do
-        if [[ "$(stat -c %s -- "${package}")" -ge "${MULTIPART_THRESHOLD}" ]]; then
+        if multipart "${package}"; then
             MULTIPART=true
         fi
     done
@@ -308,8 +337,9 @@ fi
 
 # backoff ATTEMPT: sleeps a random time up to min(30, 2^(ATTEMPT-1)) seconds.
 backoff() {
-    local cap=$((1 << ($1 - 1))) milliseconds
-    (( cap > 30 )) && cap=30
+    local cap=30 milliseconds
+    # 2^(ATTEMPT-1) only while it is under 30: a larger shift overflows.
+    (( $1 <= 5 )) && cap=$((1 << ($1 - 1)))
     milliseconds=$((RANDOM * 32768 + RANDOM))
     milliseconds=$((milliseconds % (cap * 1000 + 1)))
     sleep "$((milliseconds / 1000)).$(printf '%03d' $((milliseconds % 1000)))"
@@ -322,7 +352,7 @@ put_immutable() {
     local key=$1 file=$2 type=$3 status attempt=1
     while true; do
         status=0
-        if [[ "$(stat -L -c %s -- "${file}")" -ge "${MULTIPART_THRESHOLD}" ]]; then
+        if multipart "${file}"; then
             ar_put_multipart "${key}" "${file}" "${type}" "${IMMUTABLE_CACHE}" "${MULTIPART_CHUNKSIZE}" || status=$?
         else
             ar_put_object "${key}" "${file}" "${type}" "${IMMUTABLE_CACHE}" "*" || status=$?
@@ -531,6 +561,9 @@ publish_arch() {
     local arch=$1 attempt=0 key status creating etag version_id="" index_key remote build="" out file name version
     local stage="${AR_WORK}/stage/${arch}" receipt="${AR_WORK}/receipt/arch/${arch}" entries
     local -a new skipped
+    # The SHA-256 of each index this run tried to upload, and the packages it
+    # added: a write the AWS CLI reported as failed may still have landed.
+    local -A tried=()
     key="${PREFIX}/${arch}/APKINDEX.tar.gz"
     mkdir -p "${receipt}"
     while true; do
@@ -559,6 +592,24 @@ publish_arch() {
                 ;;
             *) ar_die "Access to $(ar_s3_url "${key}") was denied. It may not exist." "$(ar_denied_hint "${key}")" ;;
         esac
+        # Our own earlier write, read back: the AWS CLI retries a PutObject
+        # whose response was lost, and the retry gets 412 (or 409) from the
+        # write it made itself. Its packages were published then.
+        if [[ "${creating}" == "false" && -n "${tried[$(ar_sha256 "${remote}/APKINDEX.tar.gz")]+set}" ]]; then
+            read -r -a new <<< "${tried[$(ar_sha256 "${remote}/APKINDEX.tar.gz")]}" || true
+            skipped=()
+            for package in "${stage}"/*.apk; do
+                file=$(basename -- "${package}")
+                if [[ " ${new[*]+${new[*]}} " != *" ${file} "* ]]; then
+                    skipped+=("${file}")
+                fi
+            done
+            echo "${arch}: published ${new[*]:-no new packages}: the index read back is the one an earlier attempt uploaded, though the AWS CLI reported that write as failed."
+            out="${remote}/APKINDEX.tar.gz"
+            entries="${remote}/index/entries.tsv"
+            receipt_shas "${arch}" "${entries}"
+            break
+        fi
         declare -A listed=()
         while IFS=$'\t' read -r name version _; do
             listed[${name}-${version}.apk]=1
@@ -701,6 +752,7 @@ publish_arch() {
                 break
                 ;;
             "${AR_PRECONDITION}" | "${AR_CONFLICT}" | "${AR_ABSENT}")
+                tried[$(ar_sha256 "${out}")]=${new[*]+${new[*]}}
                 if (( attempt >= MAX_ATTEMPTS )); then
                     ar_die "$(ar_s3_url "${key}") kept changing while ${arch} was being published; gave up after ${MAX_ATTEMPTS} attempts." \
                         "Another publish is writing the same repository; run this one again, or raise max_attempts."

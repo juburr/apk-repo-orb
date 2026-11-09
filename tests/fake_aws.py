@@ -13,8 +13,11 @@ real. Errors are printed as AWS CLI 2.34+ prints them, with exit code 254.
   FAKE_AWS_RULES            a file of rules, one per line:
                               OPERATION KEY_REGEX STATUS [COUNT]
                             OPERATION is GetObject or PutObject; STATUS is
-                            403, 404, 409, 412 or 500, or ignore (make the
-                            write, ignoring its condition). A rule with a
+                            403, 404, 409, 412 or 500, ignore (make the
+                            write, ignoring its condition), or landed-412
+                            (make the write, then answer 412, as the AWS
+                            CLI's retry of a write whose response was lost
+                            gets from the write it made). A rule with a
                             COUNT applies that many times.
   FAKE_AWS_IGNORE_CONDITIONS=1
                             a backend that ignores If-Match and If-None-Match
@@ -31,6 +34,9 @@ real. Errors are printed as AWS CLI 2.34+ prints them, with exit code 254.
   FAKE_AWS_NO_MULTIPART_CONDITIONS=1
                             an old CLI, whose complete-multipart-upload
                             can't take --if-none-match
+  FAKE_AWS_NO_CHECKSUM_ECHO=1
+                            a service that checks an UploadPart's
+                            --checksum-sha256 but doesn't echo it back
 
 Multipart uploads keep their parts in $FAKE_S3_DIR/.uploads/<id>/ until
 they complete or are aborted. As S3 does, every part but the last must be
@@ -273,6 +279,8 @@ def main(argv):
                 target.write(body)
             with open(os.path.join(versions, version + ".json"), "w") as stream:
                 json.dump(values, stream)
+        if status == "landed-412":
+            error(operation, "412")
         output(options, {"ETag": values["ETag"], "VersionId": version})
     return 0
 
@@ -335,7 +343,8 @@ def multipart(operation, options, root, bucket, key, path, meta, versions, exist
         with open(os.path.join(upload_dir, "%05d.json" % number), "w") as stream:
             json.dump({"ETag": etag, "ChecksumSHA256": checksum}, stream)
         output(options, {"ETag": etag,
-                         "ChecksumSHA256": checksum if upload["ChecksumAlgorithm"] or "--checksum-sha256" in options else None})
+                         "ChecksumSHA256": None if os.environ.get("FAKE_AWS_NO_CHECKSUM_ECHO")
+                         else checksum if upload["ChecksumAlgorithm"] or "--checksum-sha256" in options else None})
         return 0
     # CompleteMultipartUpload
     if os.environ.get("FAKE_AWS_NO_MULTIPART_CONDITIONS") and ("--if-none-match" in options or "--if-match" in options):

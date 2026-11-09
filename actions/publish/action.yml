@@ -53,8 +53,9 @@ inputs:
       Public keys to trust, space-separated: files named <key>.rsa.pub, or
       directories whose *.rsa.pub files are all trusted, from your
       checkout. It must hold <key_name>.pub, which the private key has to
-      match, and the key of whatever signed the bucket's index. Environment
-      variables are expanded.
+      match, the key of whatever signed the bucket's index, and a key that
+      signed each listed package's sidecar, which publish verifies too.
+      Environment variables are expanded.
     required: true
   packages_dir:
     default: packages
@@ -67,6 +68,9 @@ inputs:
     description: >
       Name of the environment variable that holds the PEM private key (or
       the PEM base64-encoded), such as from a context. Never the key itself.
+      publish reads it before running anything and takes it out of the
+      environment. Names starting with AR_, PARAM_ or SCRIPT_APK_REPO_ are
+      the orb's own and refused.
   key_name:
     description: >
       The key's name, ending in .rsa, such as my-org-apk.rsa. Signatures are

@@ -65,11 +65,21 @@ s3() { printf '%s\n' "${CASE}/s3/bucket/$1"; }
 # ------------------------------------------------------------------ set up
 STUBS="${WORK}/stubs"
 mkdir -p "${STUBS}" "${WORK}/keys" "${WORK}/keyring" "${WORK}/other-keyring"
-printf '#!/bin/sh\nexec python3 -I "%s/tests/fake_aws.py" "$@"\n' "${ROOT}" > "${STUBS}/aws"
-# The melange stand-in also notes any run that could see the signing key.
-# shellcheck disable=SC2016 # the stand-in expands it, not this script
-printf '#!/bin/sh\nif [ -n "${APK_SIGNING_KEY:-}" ]; then echo "$1" >> "%s/key-seen"; fi\nexec python3 -I "%s/tests/apk_fixtures.py" "$@"\n' \
-    "${WORK}" "${ROOT}" > "${STUBS}/melange"
+# Every tool the scripts run (the AWS CLI, melange, python3 and openssl)
+# notes a run whose environment holds a private key, in any variable, in
+# WORK/key-seen: publish must take the key out of its environment before it
+# runs anything.
+REAL_PYTHON3=$(command -v python3)
+REAL_OPENSSL=$(command -v openssl)
+# seen TOOL: the line each stand-in starts with.
+# shellcheck disable=SC2016 # the stand-ins expand these, not this script
+seen() {
+    printf 'if env | grep -q -- "-----BEGIN .*PRIVATE KEY-----"; then echo "%s $*" >> "%s/key-seen"; fi\n' "$1" "${WORK}"
+}
+{ printf '#!/bin/sh\n'; seen aws; printf 'exec "%s" -I "%s/tests/fake_aws.py" "$@"\n' "${REAL_PYTHON3}" "${ROOT}"; } > "${STUBS}/aws"
+{ printf '#!/bin/sh\n'; seen melange; printf 'exec "%s" -I "%s/tests/apk_fixtures.py" "$@"\n' "${REAL_PYTHON3}" "${ROOT}"; } > "${STUBS}/melange"
+{ printf '#!/bin/sh\n'; seen python3; printf 'exec "%s" "$@"\n' "${REAL_PYTHON3}"; } > "${STUBS}/python3"
+{ printf '#!/bin/sh\n'; seen openssl; printf 'exec "%s" "$@"\n' "${REAL_OPENSSL}"; } > "${STUBS}/openssl"
 printf '#!/bin/sh\necho "$@" >> "%s/sleeps"\n' "${WORK}" > "${STUBS}/sleep"
 chmod +x "${STUBS}"/*
 FIXTURES="python3 -I ${ROOT}/tests/apk_fixtures.py"
@@ -682,6 +692,54 @@ for bad in PARAM_MULTIPART_THRESHOLD=4MB PARAM_MULTIPART_THRESHOLD=6GB PARAM_MUL
 done
 check "before any AWS call" not_logged '.'
 
+begin "U-10: a write the AWS CLI reports as failed, though it landed"
+new_case
+package x86_64 hello 1.0.0-r0
+publish_new
+rm -rf "${CASE}/packages"
+package x86_64 world 2.1-r3
+# The index write lands, then answers 412: the AWS CLI's retry of a
+# PutObject whose response was lost gets that from the write it made.
+echo 'PutObject /APKINDEX\.tar\.gz$ landed-412 1' > "${CASE}/rules"
+: > "${CASE}/aws.log"
+run publish
+check "the publish succeeds" succeeded
+check "saying the index read back is its own" said "the index read back is the one an earlier attempt uploaded"
+check "and the receipt reports the package as published, not as already there" json_is "${CASE}/apk-repo-receipt.json" \
+    'r["architectures"]["x86_64"]["published"], r["architectures"]["x86_64"]["skipped_identical"], r["architectures"]["x86_64"]["attempts"]' \
+    "(['world-2.1-r3.apk'], [], 2)"
+check "having written the index once" [ "$(grep -c '^PutObject test/os/x86_64/APKINDEX\.tar\.gz ' "${CASE}/aws.log")" -eq 1 ]
+
+begin "U-17: multipart uploads, continued"
+new_case
+big_package x86_64 big 1.0-r0
+FAKE_AWS_NO_CHECKSUM_ECHO=1 publish_new "${MULTIPART[@]}"
+check "a service that doesn't echo part checksums still completes the upload" succeeded
+check "with the checksums computed here" logged '^CompleteMultipartUpload test/os/x86_64/big-1\.0-r0\.apk if-none-match '
+new_case
+mkdir -p "${CASE}/packages/x86_64"
+# Nine 5 MiB parts: one batch of eight, then one more.
+${FIXTURES} build "${CASE}/packages/x86_64/huge-1.0-r0.apk" huge 1.0-r0 x86_64 --key "${WORK}/keys/build.rsa" \
+    --random "usr/share/huge/blob=$((42 * 1024 * 1024))"
+echo 'UploadPart huge-1\.0-r0\.apk$ 500 1' > "${CASE}/rules"
+publish_new "${MULTIPART[@]}"
+check "a failed part fails the upload" failed
+check "and no part after its batch is started" [ "$(grep -c '^UploadPart test/os/x86_64/huge' "${CASE}/aws.log")" -eq 8 ]
+check "which is aborted" logged '^AbortMultipartUpload test/os/x86_64/huge-1\.0-r0\.apk '
+publish_new PARAM_MULTIPART_THRESHOLD=17179869185GB
+check "a size too large for 64-bit arithmetic is a usage error (2), not a wrapped-around one" exited 2
+
+begin "U-3: a packages_dir with pattern characters in its name"
+new_case
+package x86_64 hello 1.0.0-r0 "${CASE}/out[1]"
+publish_new PARAM_PACKAGES_DIR='out[1]'
+check "is a path, not a pattern" succeeded
+check "publishing its package" exists "$(s3 test/os/x86_64/hello-1.0.0-r0.apk)"
+new_case
+package x86_64 hello 1.0.0-r0 "${CASE}/out[1]"
+publish_new PARAM_PACKAGES_DIR='out[1]' PARAM_ARCH=
+check "with the architectures found in it too" succeeded
+
 # ------------------------------------------------------------------ pull
 echo "=== pull"
 
@@ -1264,7 +1322,15 @@ new_case
 package x86_64 hello 1.0.0-r0
 rm -f "${WORK}/key-seen"
 publish_new
-check "melange never sees the key's variable" absent "${WORK}/key-seen"
+check "no tool publish runs (aws, python3, openssl, melange) has the key in its environment" absent "${WORK}/key-seen"
+rm -f "${WORK}/key-seen"
+publish_new PARAM_SIGNING_KEY=SIGNING_KEY SIGNING_KEY="${SIGNING_KEY_PEM}" APK_SIGNING_KEY=
+check "signing_key may name a variable the script itself uses (SIGNING_KEY)" succeeded
+check "and no tool sees that one either" absent "${WORK}/key-seen"
+publish_new PARAM_SIGNING_KEY=AR_KEY AR_KEY="${SIGNING_KEY_PEM}"
+check "but not one of the orb's own names (AR_*), a usage error (2)" exited 2
+publish_new PARAM_SIGNING_KEY=PARAM_KEY PARAM_KEY="${SIGNING_KEY_PEM}"
+check "or PARAM_*" exited 2
 openssl genrsa -aes256 -passout pass:secret -out "${CASE}/encrypted.pem" 2048 2> /dev/null
 publish_new APK_SIGNING_KEY="$(cat "${CASE}/encrypted.pem")" < /dev/null
 check "an encrypted key fails at once (2)" exited 2
