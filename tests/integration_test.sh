@@ -301,8 +301,11 @@ package x86_64 hello 1.0-r0
 run publish allow_create=true
 key="${PREFIX}/x86_64/hello-1.0-r0.apk"
 etag=$(s3_etag "${key}")
-cp "${WORK}/object" "${WORK}/tampered.apk"
-printf 'x' >> "${WORK}/tampered.apk"
+# The same size, with its last byte changed: an extra byte would be refused
+# before the sidecar is even compared, by the download's cap at the index's
+# size (P-11, which the offline tests cover).
+python3 -I -c 'import sys; data = bytearray(open(sys.argv[1], "rb").read()); data[-1] ^= 1; open(sys.argv[2], "wb").write(data)' \
+    "${WORK}/object" "${WORK}/tampered.apk"
 # The test replaces the object the way only a writer with the current ETag
 # can; the orb never would. A bucket with the README's bucket policy refuses
 # that write, which leaves no tampered package to pull.
